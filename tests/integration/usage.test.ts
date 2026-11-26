@@ -271,7 +271,7 @@ describe('usage recorder', () => {
 
     await expect(
       recorder.recordTextGeneration({ organizationId: missingOrganization, agentId: null }, 'chat_response', chatReport),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ estimatedCostUsd: 0.00089, pricingKnown: true });
     await expect(
       recorder.recordEmbedding({ organizationId: 'not-a-uuid' }, 'knowledge_query', {
         provider: 'openai',
@@ -279,7 +279,7 @@ describe('usage recorder', () => {
         inputTokens: 12,
         durationMs: 3,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ estimatedCostUsd: 0.00000024, pricingKnown: true });
 
     const failures = logger.events('usage.record_failed');
     expect(failures).toHaveLength(2);
@@ -315,7 +315,7 @@ describe('usage recorder', () => {
 
     await expect(
       recorder.recordTextGeneration({ organizationId: randomUUID() }, 'chat_response', chatReport),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({ pricingKnown: true });
     expect(logger.events('usage.record_failed')).toHaveLength(1);
   });
 

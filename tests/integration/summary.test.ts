@@ -8,6 +8,7 @@ import type { Database } from '@/server/db/types';
 import { appendMessage, getConversation } from '@/server/domain/conversations/service';
 import type { Message, MessageRole } from '@/server/domain/conversations/types';
 import { createCostEstimator } from '@/server/domain/usage/cost';
+import { unlimitedUsageGuard } from '@/server/domain/usage/limits';
 import { createUsageRecorder } from '@/server/domain/usage/service';
 import type { LogFields, Logger } from '@/server/observability/logger';
 import { createTestDatabase, type TestDatabase } from '../support/db';
@@ -84,7 +85,7 @@ async function createHarness(
   );
   const logger = new RecordingLogger();
   const usage = createUsageRecorder({ db: t.db, costs: createCostEstimator(), logger });
-  const deps: SummaryDeps = { db: options.db ?? t.db, router, usage, ai, logger };
+  const deps: SummaryDeps = { db: options.db ?? t.db, router, usage, guard: unlimitedUsageGuard, ai, logger };
   const tenant: TenantFixture = await t.service.run((sql) => createTenant(sql));
   const conversationId = (await t.service.run((sql) => createConversation(sql, tenant.org.id, tenant.agent.id))).id;
   const params = { organizationId: tenant.org.id, agentId: tenant.agent.id, conversationId, channel: 'web_chat' as const };
@@ -186,7 +187,7 @@ describe('updateRollingSummary', () => {
         purpose: 'conversation_summary',
         provider: 'cheap',
         model: 'cheap-model',
-        metadata: { tier: 'default' },
+        metadata: { tier: 'default', route: 'default' },
         conversation_id: h.conversationId,
       },
     ]);

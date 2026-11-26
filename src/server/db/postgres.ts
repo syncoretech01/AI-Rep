@@ -7,7 +7,8 @@ import type { Database, Sql, SqlParam } from './types';
 
 // node-postgres merges these URL parameters OVER an explicit `ssl` option, so they are removed: TLS comes
 // only from DATABASE_SSL / DATABASE_SSL_CA.
-const URL_TLS_PARAMETERS = ['ssl', 'sslmode', 'sslrootcert', 'sslcert', 'sslkey', 'sslpassword', 'uselibpqcompat'];
+// host/hostaddr would override the URL host (and the TLS host check made on it); config validation refuses them too.
+const URL_TLS_PARAMETERS = ['ssl', 'sslmode', 'sslrootcert', 'sslcert', 'sslkey', 'sslpassword', 'uselibpqcompat', 'host', 'hostaddr'];
 
 /** Connection options shared by the app pool and the migration CLI. */
 export function pgConnectionOptions(config: DatabaseConfig): { connectionString: string; ssl: false | ConnectionOptions } {

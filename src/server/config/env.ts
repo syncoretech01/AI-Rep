@@ -1,5 +1,7 @@
 import 'server-only';
 import { z } from 'zod';
+import { DEFAULT_RETRY_POLICY, type RetryPolicy } from '@/server/ai/retry';
+import { PRICING_SNAPSHOT_DATE } from './pricing';
 
 /**
  * Server configuration, validated with Zod. Sections are parsed lazily so a
@@ -34,7 +36,11 @@ function parseSection<T extends z.ZodType>(name: string, schema: T, env: Env): z
 
 const databaseSchema = z
   .object({
-    DATABASE_URL: z.string().regex(/^postgres(ql)?:\/\//, 'must be a postgres:// connection string'),
+    DATABASE_URL: z
+      .string()
+      .regex(/^postgres(ql)?:\/\//, 'must be a postgres:// connection string')
+      // node-postgres lets ?host= / ?hostaddr= override the URL host, which would bypass the TLS host check below.
+      .refine((url) => !/[?&](host|hostaddr)=/i.test(url), 'must not set host or hostaddr as a query parameter'),
     DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(50).default(5),
     // TLS is configured here, not with ?sslmode in the URL (node-postgres would let URL parameters silently
     // override these settings). auto: no TLS for local hosts; otherwise TLS, verified when a CA is given.
@@ -45,11 +51,11 @@ const databaseSchema = z
       .optional()
       .transform((value) => value?.replaceAll('\\n', '\n').trim() || undefined)
       .refine((value) => value === undefined || value.includes('-----BEGIN CERTIFICATE-----'), {
-        message: 'must be a PEM certificate',
+        error: 'must be a PEM certificate',
       }),
   })
   .refine((value) => value.DATABASE_SSL !== 'verify' || value.DATABASE_SSL_CA !== undefined, {
-    message: 'DATABASE_SSL=verify needs DATABASE_SSL_CA',
+    error: 'DATABASE_SSL=verify needs DATABASE_SSL_CA',
     path: ['DATABASE_SSL_CA'],
   });
 
@@ -64,7 +70,36 @@ export interface DatabaseConfig {
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
+function databaseHost(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    // An unparsable URL fails at connect time with the driver's own error.
+    return '';
+  }
+}
+
+/** True when the connection goes to another host without certificate verification (no DATABASE_SSL_CA). */
+export function isUnverifiedRemoteDatabase(config: DatabaseConfig): boolean {
+  return !LOCAL_HOSTS.has(databaseHost(config.url)) && config.tls.mode !== 'verify';
+}
+
+/**
+ * In production (NODE_ENV=production) a database on another host must be reached over VERIFIED TLS
+ * (DATABASE_SSL_CA): an unverified connection would let a network attacker impersonate the database.
+ */
 export function loadDatabaseConfig(env: Env = process.env): DatabaseConfig {
+  const config = resolveDatabaseConfig(env);
+  if (env.NODE_ENV === 'production' && isUnverifiedRemoteDatabase(config)) {
+    throw new Error(
+      'Invalid database configuration:\n  - DATABASE_SSL_CA: production requires verified TLS to a remote database ' +
+        '(set DATABASE_SSL_CA to the provider CA certificate; DATABASE_SSL=require/disable is not allowed)',
+    );
+  }
+  return config;
+}
+
+function resolveDatabaseConfig(env: Env): DatabaseConfig {
   const parsed = parseSection('database', databaseSchema, env);
   const ca = parsed.DATABASE_SSL_CA;
   let tls: DatabaseTls;
@@ -80,12 +115,7 @@ export function loadDatabaseConfig(env: Env = process.env): DatabaseConfig {
       tls = { mode: 'verify', ca: ca ?? '' };
       break;
     case 'auto': {
-      let host = '';
-      try {
-        host = new URL(parsed.DATABASE_URL).hostname;
-      } catch {
-        // An unparsable URL fails at connect time with the driver's own error.
-      }
+      const host = databaseHost(parsed.DATABASE_URL);
       tls = ca ? { mode: 'verify', ca } : LOCAL_HOSTS.has(host) ? { mode: 'disable' } : { mode: 'require' };
       break;
     }
@@ -138,7 +168,8 @@ const aiSchema = z.object({
   AI_TEXT_MODEL: nonEmpty.default('gpt-6-luna'),
   AI_TEXT_REASONING_EFFORT: reasoningEffortSchema.default('low'),
   AI_ESCALATION_PROVIDER: nonEmpty.default('openai'),
-  AI_ESCALATION_MODEL: nonEmpty.default('gpt-6-sol'),
+  // The current Sol model (developers.openai.com/api/docs/models, 2026-11-26). It rejects reasoning effort 'none'.
+  AI_ESCALATION_MODEL: nonEmpty.default('gpt-6.2-sol'),
   AI_ESCALATION_REASONING_EFFORT: reasoningEffortSchema.default('medium'),
   AI_ESCALATION_ENABLED: booleanString.default(true),
   AI_EMBEDDING_PROVIDER: nonEmpty.default('openai'),
@@ -147,7 +178,7 @@ const aiSchema = z.object({
     .number()
     .int()
     .refine((value) => value === EMBEDDING_DIMENSIONS, {
-      message: `must be ${EMBEDDING_DIMENSIONS} to match knowledge_chunks.embedding`,
+      error: `must be ${EMBEDDING_DIMENSIONS} to match knowledge_chunks.embedding`,
     })
     .default(EMBEDDING_DIMENSIONS),
   AI_MAX_RETRIEVED_CHUNKS: z.coerce.number().int().min(1).max(20).default(5),
@@ -156,7 +187,21 @@ const aiSchema = z.object({
   AI_MIN_RETRIEVAL_SIMILARITY: z.coerce.number().min(0).max(1).default(0.3),
   AI_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(64).max(8192).default(800),
   AI_MAX_TOOL_ROUNDS: z.coerce.number().int().min(1).max(8).default(4),
+  // Hard caps per turn and per conversation (cost and abuse controls).
+  AI_MAX_TOOL_CALLS_PER_TURN: z.coerce.number().int().min(1).max(20).default(6),
+  AI_MAX_TURN_TOKENS: z.coerce.number().int().min(2_000).max(500_000).default(40_000),
+  AI_MAX_CONVERSATION_TURNS: z.coerce.number().int().min(1).max(10_000).default(100),
+  // Escalated (premium-model) calls per conversation: escalation triggers can be provoked by a visitor.
+  AI_MAX_ESCALATED_CALLS_PER_CONVERSATION: z.coerce.number().int().min(0).max(100).default(6),
   AI_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(30_000),
+  // Same-model retries of retryable provider failures (429, timeouts, 5xx). 0 disables them.
+  AI_PROVIDER_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
+  // Organization-level estimated AI spend limits (USD, UTC day / calendar month). Per-organization overrides live
+  // in app_private.organization_limits. 0 blocks all AI calls for organizations without an override.
+  AI_ORG_DAILY_SPEND_LIMIT_USD: z.coerce.number().min(0).max(1_000_000).default(10),
+  AI_ORG_MONTHLY_SPEND_LIMIT_USD: z.coerce.number().min(0).max(10_000_000).default(150),
+  // Label stored with every cost estimate (the date of the price list the estimate used).
+  AI_PRICING_VERSION: z.string().trim().min(1).max(64).default(PRICING_SNAPSHOT_DATE),
   AI_MODEL_PRICING_JSON: z
     .string()
     .optional()
@@ -196,10 +241,22 @@ export interface AiConfig {
     minRetrievalSimilarity: number;
     maxOutputTokens: number;
     maxToolRounds: number;
+    /** Tool calls executed per turn; further calls are refused (and audited). */
+    maxToolCallsPerTurn: number;
+    /** Provider-reported input + output tokens per turn; no further round starts once reached. */
+    maxTurnTokens: number;
+    /** Visitor messages per conversation (default; overridable per organization). */
+    maxConversationTurns: number;
+    /** Premium-model calls per conversation; further escalations are declined (the default model continues). */
+    maxEscalatedCallsPerConversation: number;
   };
   requestTimeoutMs: number;
+  retry: RetryPolicy;
+  /** Default organization spend limits (USD); app_private.organization_limits overrides them per organization. */
+  spendLimits: { dailyUsd: number; monthlyUsd: number };
   /** Per-model price overrides merged over the built-in pricing snapshot. */
   pricingOverrides: Record<string, ModelPrice>;
+  pricingVersion: string;
 }
 
 export function loadAiConfig(env: Env = process.env): AiConfig {
@@ -228,9 +285,16 @@ export function loadAiConfig(env: Env = process.env): AiConfig {
       minRetrievalSimilarity: parsed.AI_MIN_RETRIEVAL_SIMILARITY,
       maxOutputTokens: parsed.AI_MAX_OUTPUT_TOKENS,
       maxToolRounds: parsed.AI_MAX_TOOL_ROUNDS,
+      maxToolCallsPerTurn: parsed.AI_MAX_TOOL_CALLS_PER_TURN,
+      maxTurnTokens: parsed.AI_MAX_TURN_TOKENS,
+      maxConversationTurns: parsed.AI_MAX_CONVERSATION_TURNS,
+      maxEscalatedCallsPerConversation: parsed.AI_MAX_ESCALATED_CALLS_PER_CONVERSATION,
     },
     requestTimeoutMs: parsed.AI_REQUEST_TIMEOUT_MS,
+    retry: { ...DEFAULT_RETRY_POLICY, maxRetries: parsed.AI_PROVIDER_MAX_RETRIES },
+    spendLimits: { dailyUsd: parsed.AI_ORG_DAILY_SPEND_LIMIT_USD, monthlyUsd: parsed.AI_ORG_MONTHLY_SPEND_LIMIT_USD },
     pricingOverrides: parsed.AI_MODEL_PRICING_JSON,
+    pricingVersion: parsed.AI_PRICING_VERSION,
   };
 }
 

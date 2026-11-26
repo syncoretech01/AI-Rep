@@ -57,6 +57,28 @@ function describe(error: APIError, code: string | undefined): string {
   return parts.length > 0 ? ` (${parts.join(', ')})` : '';
 }
 
+/** Upper bound on a parsed Retry-After: anything larger is treated as "far too long" by the retry policy anyway. */
+const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
+const HTTP_DATE = /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * The provider's requested wait, from `retry-after-ms` (milliseconds, OpenAI) or the standard `retry-after`
+ * (seconds or an HTTP date). Undefined when absent or unparsable.
+ */
+export function retryAfterMsFrom(headers: Headers | undefined, now: number = Date.now()): number | undefined {
+  if (!headers || typeof headers.get !== 'function') return undefined;
+  const clamp = (ms: number) => (Number.isFinite(ms) && ms >= 0 ? Math.min(Math.round(ms), MAX_RETRY_AFTER_MS) : undefined);
+  const milliseconds = headers.get('retry-after-ms')?.trim();
+  if (milliseconds && /^\d+(\.\d+)?$/.test(milliseconds)) return clamp(Number(milliseconds));
+  const value = headers.get('retry-after')?.trim();
+  if (!value) return undefined;
+  if (/^\d+(\.\d+)?$/.test(value)) return clamp(Number(value) * 1000);
+  // HTTP-date in the IMF-fixdate form servers send, e.g. "Thu, 26 Nov 2026 10:00:05 GMT".
+  if (!HTTP_DATE.test(value)) return undefined;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : clamp(Math.max(0, date - now));
+}
+
 /**
  * Normalizes any failure from the OpenAI SDK (or our own call plumbing) into a
  * ProviderError. Messages are built from safe identifiers only; the original
@@ -64,8 +86,17 @@ function describe(error: APIError, code: string | undefined): string {
  */
 export function toProviderError(error: unknown, provider: string): ProviderError {
   if (error instanceof ProviderError) return error;
+  const retryAfterMs = isAPIError(error) ? retryAfterMsFrom(error.headers) : undefined;
   const fail = (code: ProviderErrorCode, retryable: boolean, message: string, status?: number) =>
-    new ProviderError({ provider, code, retryable, message: `${provider}: ${message}`, status, cause: error });
+    new ProviderError({
+      provider,
+      code,
+      retryable,
+      message: `${provider}: ${message}`,
+      status,
+      ...(retryable && retryAfterMs !== undefined && { retryAfterMs }),
+      cause: error,
+    });
 
   if (error instanceof APIUserAbortError) {
     // The SDK reports any aborted signal as a user abort; the abort reason tells a deadline apart.
@@ -79,7 +110,8 @@ export function toProviderError(error: unknown, provider: string): ProviderError
     const code = safeCode(error.code);
     const detail = describe(error, code);
     if (error instanceof RateLimitError) {
-      return isQuotaCode(code)
+      // Billing/quota 429s carry a specific code, or at least type "insufficient_quota": retrying cannot help.
+      return isQuotaCode(code) || error.type === 'insufficient_quota'
         ? fail('rate_limited', false, `quota exhausted${detail}`, error.status)
         : fail('rate_limited', true, `rate limited${detail}`, error.status);
     }
@@ -94,6 +126,9 @@ export function toProviderError(error: unknown, provider: string): ProviderError
     if (error instanceof InternalServerError) return fail('unavailable', true, `server error${detail}`, error.status);
     // An `error` event inside an SSE stream surfaces as an APIError without an HTTP status.
     if (error.status === undefined) return fail('unavailable', true, `stream error${detail}`);
+    // 408 Request Timeout and 409 Conflict (e.g. a lock on the provider side) are transient by HTTP semantics.
+    if (error.status === 408) return fail('timeout', true, `request timeout${detail}`, error.status);
+    if (error.status === 409) return fail('unavailable', true, `conflict${detail}`, error.status);
     return fail('unknown', false, `unexpected response${detail}`, error.status);
   }
   if (hasErrorName(error, 'TimeoutError')) return fail('timeout', true, 'request timed out');
@@ -128,7 +163,8 @@ export interface ProviderCall {
 
 /**
  * The SDK `timeout` only bounds the wait for response headers, so every call also
- * gets an overall deadline (covering retries and the streamed body).
+ * gets an overall deadline (covering the streamed body). Retries happen above the
+ * adapter (src/server/ai/retry.ts), so each attempt gets its own deadline.
  */
 export function startProviderCall(provider: string, timeoutMs: number, callerSignal?: AbortSignal): ProviderCall {
   const deadline = AbortSignal.timeout(timeoutMs);

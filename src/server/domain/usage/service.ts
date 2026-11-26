@@ -2,7 +2,7 @@ import { jsonParam } from '@/server/db/sql';
 import type { Database } from '@/server/db/types';
 import type { Logger } from '@/server/observability/logger';
 import type { CostEstimate, CostEstimator } from './cost';
-import type { UsageContext, UsageRecorder } from './types';
+import type { RecordedUsage, UsageContext, UsageRecorder } from './types';
 
 /** The counters of one usage_records row, named like the TokenUsage fields they come from. */
 interface UsageCounts {
@@ -42,23 +42,32 @@ function label(value: string, maxChars: number): string {
  * the privileged connection (system records; members only read them) as their
  * own statement — never call this inside an open transaction.
  */
-export function createUsageRecorder(deps: { db: Database; costs: CostEstimator; logger: Logger }): UsageRecorder {
+export function createUsageRecorder(deps: {
+  db: Database;
+  costs: CostEstimator;
+  logger: Logger;
+  /** Stored with every estimate (AI_PRICING_VERSION): which price list produced it. */
+  pricingVersion?: string;
+}): UsageRecorder {
   const { db, costs, logger } = deps;
+  const pricingVersion = deps.pricingVersion ?? null;
   const unpricedModels = new Set<string>();
 
-  async function persist(context: UsageContext, build: () => UsageEntry): Promise<void> {
+  async function persist(context: UsageContext, build: () => UsageEntry): Promise<RecordedUsage> {
     let entry: UsageEntry | undefined;
+    let recorded: RecordedUsage = { estimatedCostUsd: 0, pricingKnown: false };
     try {
       entry = build();
       const { counts, cost } = entry;
       const usd = Number.isFinite(cost.usd) && cost.usd > 0 ? cost.usd : 0;
+      recorded = { estimatedCostUsd: usd, pricingKnown: cost.known };
       if (!cost.known) warnUnpriced(entry.provider, entry.model);
       await db.query(
         `insert into public.usage_records
            (organization_id, agent_id, conversation_id, kind, purpose, provider, model,
             input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
-            tool_calls, duration_ms, estimated_cost_usd, pricing_known, metadata)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb)`,
+            tool_calls, duration_ms, estimated_cost_usd, pricing_known, metadata, pricing_version)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18)`,
         [
           context.organizationId,
           context.agentId ?? null,
@@ -77,6 +86,7 @@ export function createUsageRecorder(deps: { db: Database; costs: CostEstimator; 
           usd.toFixed(8),
           cost.known,
           jsonParam(entry.metadata),
+          cost.known ? pricingVersion : null,
         ],
       );
     } catch (error) {
@@ -98,6 +108,7 @@ export function createUsageRecorder(deps: { db: Database; costs: CostEstimator; 
         error,
       });
     }
+    return recorded;
   }
 
   function warnUnpriced(provider: string, model: string): void {

@@ -26,11 +26,8 @@ const nextConfig: NextConfig = {
           { key: 'Content-Security-Policy', value: "frame-ancestors 'none'" },
         ],
       },
-      // The chat widget page is designed to be embedded on customer websites.
-      {
-        source: '/widget/:path*',
-        headers: [{ key: 'Content-Security-Policy', value: 'frame-ancestors *' }],
-      },
+      // The chat widget page is embedded on customer websites: its frame-ancestors policy is set per widget by the
+      // proxy (src/server/channels/webchat/frame-policy.ts), from the widget's allowed sites.
       { source: '/embed.js', headers: [{ key: 'Cache-Control', value: 'public, max-age=300' }] },
     ]);
   },

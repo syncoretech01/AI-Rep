@@ -5,12 +5,24 @@ import type { EmbeddingProvider, ReasoningEffort, TextModelProvider } from './ty
 
 export type ModelTask = 'chat_response' | 'conversation_summary';
 
+/**
+ * Demonstrated model-quality failures of the default model in the current request — the only failures that justify
+ * the stronger model. Infrastructure failures (rate limits, timeouts, outages) are NOT here: they are retried on
+ * the same model (src/server/ai/retry.ts) and never escalate.
+ */
+export type QualityFailure =
+  /** The model kept producing tool arguments that failed validation (or named tools it was not given). */
+  | 'invalid_tool_calls'
+  /** The model returned neither text nor a tool call. */
+  | 'empty_response';
+
 export interface TextRouteRequest {
   task: ModelTask;
   channel: Channel;
+  /** Set by a caller that has demonstrated the request needs stronger reasoning. */
   complexity?: 'routine' | 'complex';
-  /** A previous attempt on the default model failed (provider error or repeated invalid tool arguments). */
-  priorFailure?: boolean;
+  /** The default model already failed on quality in this request. */
+  qualityFailure?: QualityFailure;
 }
 
 export interface TextRoute {
@@ -20,7 +32,7 @@ export interface TextRoute {
   model: string;
   /** Undefined when the profile is configured as 'default' (send no reasoning setting). */
   reasoningEffort: ReasoningEffort | undefined;
-  /** Short machine-readable reason: 'default', 'escalation:prior_failure' or 'escalation:complex'. */
+  /** Short machine-readable reason: 'default', 'escalation:quality:<failure>' or 'escalation:complex'. */
   reason: string;
 }
 
@@ -35,12 +47,16 @@ export interface EmbeddingRoute {
  * Chooses which configured provider/model serves a task. It selects
  * configuration only — prompts, tools and domain behavior never change with the route.
  *
- * Policy (AI_RUNTIME.md "Initial production routing"):
+ * Policy (AI_RUNTIME.md "Model routing"):
  * - Everything runs on the cheap default profile unless escalation is explicitly justified.
  * - Summaries (and any other summary/classification task) always use the default profile.
- * - A chat response uses the escalation profile only when escalation is enabled AND either the
- *   default model already failed on this request or the caller classified the request as complex.
- * - Message length alone never escalates.
+ * - A chat response uses the escalation profile only when escalation is enabled AND either the default model
+ *   demonstrably failed on quality in this request or the caller established that the request is complex.
+ * - Provider unavailability, rate limits and timeouts never escalate (they are retried on the same model), and
+ *   message length alone never escalates.
+ *
+ * Future provider failover belongs next to this class: a same-tier alternative route tried by the retry layer
+ * after the primary provider's retries are exhausted. It is deliberately not implemented with one provider.
  */
 export class ModelRouter {
   private readonly config: AiConfig;
@@ -67,7 +83,9 @@ export class ModelRouter {
 
   selectText(request: TextRouteRequest): TextRoute {
     if (this.canEscalate(request.task)) {
-      if (request.priorFailure) return this.textRoute('escalation', this.config.escalation, 'escalation:prior_failure');
+      if (request.qualityFailure) {
+        return this.textRoute('escalation', this.config.escalation, `escalation:quality:${request.qualityFailure}`);
+      }
       if (request.complexity === 'complex') return this.textRoute('escalation', this.config.escalation, 'escalation:complex');
     }
     return this.textRoute('default', this.config.text, 'default');
@@ -78,7 +96,7 @@ export class ModelRouter {
     return { providerId: provider, provider: this.registry.getEmbedding(provider), model, dimensions };
   }
 
-  /** True when a retry on a stronger model is allowed for this task. */
+  /** True when escalating to the stronger model is allowed for this task. */
   canEscalate(task: ModelTask): boolean {
     return this.config.escalation.enabled && task === 'chat_response';
   }

@@ -11,7 +11,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { loadDatabaseConfig, type DatabaseConfig } from '@/server/config/env';
+import { isUnverifiedRemoteDatabase, loadDatabaseConfig, type DatabaseConfig } from '@/server/config/env';
 import { loadMigrations, type MigrationFile } from '@/server/db/migrations';
 import { pgConnectionOptions } from '@/server/db/postgres';
 
@@ -124,9 +124,9 @@ function loadEnvFiles(): void {
 const describe = (migration: MigrationFile) => `${migration.version}_${migration.name}`;
 
 async function main(args: readonly string[]): Promise<number> {
-  const unknown = args.filter((arg) => arg !== '--dry-run');
+  const unknown = args.filter((arg) => arg !== '--dry-run' && arg !== '--allow-unverified-tls');
   if (unknown.length > 0) {
-    console.error(`Unknown argument: ${unknown.join(' ')}\nUsage: npm run db:migrate [-- --dry-run]`);
+    console.error(`Unknown argument: ${unknown.join(' ')}\nUsage: npm run db:migrate [-- --dry-run] [--allow-unverified-tls]`);
     return 2;
   }
   const dryRun = args.includes('--dry-run');
@@ -140,8 +140,17 @@ async function main(args: readonly string[]): Promise<number> {
     return 1;
   }
 
-  if (config.tls.mode === 'require') {
-    console.warn('Warning: TLS without certificate verification. Set DATABASE_SSL_CA to verify the database certificate.');
+  // Migrations run with the most privileged credentials: an unverified connection to a remote database is refused
+  // unless the operator explicitly accepts it (e.g. a first test against a disposable project).
+  if (isUnverifiedRemoteDatabase(config)) {
+    if (!args.includes('--allow-unverified-tls')) {
+      console.error(
+        'Refusing to migrate a remote database without verified TLS. Set DATABASE_SSL_CA to the provider CA ' +
+          'certificate (Supabase: Database settings → SSL configuration), or pass --allow-unverified-tls.',
+      );
+      return 1;
+    }
+    console.warn('Warning: TLS without certificate verification (--allow-unverified-tls).');
   }
   const client = new pg.Client({
     ...pgConnectionOptions(config),

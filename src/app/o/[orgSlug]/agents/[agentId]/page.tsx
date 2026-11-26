@@ -18,6 +18,7 @@ import { DAY_NAMES } from '@/server/domain/business/types';
 import {
   rotateWidgetKeyAction,
   setWebChatEnabledAction,
+  updateAllowedOriginsAction,
   updateAgentSettingsAction,
   updateBusinessHoursAction,
   updateBusinessProfileAction,
@@ -159,10 +160,12 @@ export default async function AgentPage({ params }: Props) {
             enabled={channel?.enabled === true}
             widgetKey={channel?.publicKey ?? null}
             origin={origin}
+            allowedOrigins={channel?.allowedOrigins ?? []}
             agentActive={agent.status === 'active'}
             readOnly={readOnly}
             toggleAction={setWebChatEnabledAction.bind(null, slug, agent.id)}
             rotateAction={rotateWidgetKeyAction.bind(null, slug, agent.id)}
+            sitesAction={updateAllowedOriginsAction.bind(null, slug, agent.id)}
           />
         </Section>
       </div>

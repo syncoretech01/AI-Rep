@@ -56,16 +56,21 @@ afterAll(async () => {
   await h.close();
 });
 
-/** A text provider that is down until `down` is cleared, then answers like the receptionist stand-in. */
+/**
+ * A text provider that is down until `down` is cleared (or for its first `failures` calls), then answers like the
+ * receptionist stand-in.
+ */
 class FlakyModel implements TextModelProvider {
   readonly id: string;
   readonly requests: TextGenerationRequest[] = [];
   down = true;
   private readonly healthy: FakeReceptionistModel;
+  private remainingFailures: number;
 
-  constructor(id: string) {
+  constructor(id: string, failures = Infinity) {
     this.id = id;
     this.healthy = new FakeReceptionistModel(id);
+    this.remainingFailures = failures;
   }
 
   async generate(request: TextGenerationRequest): Promise<TextGenerationResult> {
@@ -80,7 +85,8 @@ class FlakyModel implements TextModelProvider {
 
   private attempt(request: TextGenerationRequest): void {
     this.requests.push(request);
-    if (this.down) {
+    if (this.down && this.remainingFailures > 0) {
+      this.remainingFailures -= 1;
       throw new ProviderError({ provider: this.id, code: 'unavailable', retryable: true, message: `${this.id}: unavailable` });
     }
   }
@@ -152,66 +158,54 @@ describe('6. provider and model are chosen by configuration', () => {
     }
   });
 
-  it('serves the turn from the configured escalation model while the default provider is down', async () => {
-    const down = new ScriptedTextProvider('receptionist', () => ({
-      error: new ProviderError({ provider: 'receptionist', code: 'unavailable', retryable: true, message: 'receptionist: unavailable' }),
-    }));
-    const failover = await createAppHarness({
-      database: h.t,
-      logger: h.logger,
-      textProviders: { receptionist: down },
-      ai: { AI_ESCALATION_REASONING_EFFORT: 'high' },
-    });
+  it('rides out a transient outage on the SAME default model (bounded retries) and never switches to the premium model', async () => {
+    // Fails twice (e.g. 503s), then recovers: within AI_PROVIDER_MAX_RETRIES (2).
+    const flaky = new FlakyModel('receptionist', 2);
+    const resilient = await createAppHarness({ database: h.t, logger: h.logger, textProviders: { receptionist: flaky } });
     try {
-      expect(failover.services.ai.escalation).toMatchObject({ enabled: true, provider: 'escalation', model: 'escalation-max' });
-      const session = await failover.openSession(springfield.widgetKey);
+      expect(resilient.services.ai.escalation).toMatchObject({ enabled: true, provider: 'escalation', model: 'escalation-max' });
+      const session = await resilient.openSession(springfield.widgetKey);
 
-      const turn = await failover.sendMessage(springfield.widgetKey, session.sessionToken, QUESTIONS.emergency);
+      const turn = await resilient.sendMessage(springfield.widgetKey, session.sessionToken, QUESTIONS.emergency);
 
-      // The failed attempt streamed nothing, so the visitor just gets the answer.
+      // The failed attempts streamed nothing, so the visitor just gets the answer.
       expect(eventTypes(turn.events)).toEqual(['turn.start', 'tool.call', 'tool.result', 'text.delta', 'turn.done']);
       expect(turn.reply).toContain(SPRINGFIELD_FACTS.emergency);
-      expect(down.requests).toHaveLength(1);
-      const escalated = failover.requestsTo('escalation');
-      expect(escalated.map(({ model, reasoningEffort }) => ({ model, reasoningEffort }))).toEqual([
-        { model: 'escalation-max', reasoningEffort: 'high' },
-        { model: 'escalation-max', reasoningEffort: 'high' },
-      ]);
-      // Metered on the escalation model and marked as escalated; nothing is billed for the failed attempt.
+      expect(flaky.requests).toHaveLength(4); // 3 attempts for round 1, 1 for round 2
+      expect(resilient.requestsTo('escalation')).toEqual([]);
+      // Metered on the default model only: nothing is billed for the failed attempts.
       const chat = chatRows(await h.usage(organizationId, turn.conversationId));
-      expect(chat.map(({ provider, metadata }) => ({ provider, tier: metadata.tier }))).toEqual([
-        { provider: 'escalation', tier: 'escalation' },
-        { provider: 'escalation', tier: 'escalation' },
+      expect(chat.map(({ provider, metadata }) => ({ provider, tier: metadata.tier, attempts: metadata.attempts }))).toEqual([
+        { provider: 'receptionist', tier: 'default', attempts: 3 },
+        { provider: 'receptionist', tier: 'default', attempts: 1 },
       ]);
-      expectPricedAs(chat, 'escalation-max');
-      const assistant = (await h.messages(organizationId, turn.conversationId)).at(-1);
-      expect(assistant).toMatchObject({ role: 'assistant', data: { model: 'escalation-max', tier: 'escalation', rounds: 2 } });
-      expect(h.logger.take('agent.turn.escalated')).toEqual([
-        { level: 'warn', event: 'agent.turn.escalated', fields: expect.objectContaining({ trigger: 'provider_error', errorCode: 'unavailable' }) as unknown },
+      expectPricedAs(chat, 'receptionist-mini');
+      // Operators see each retry as a warning; nothing escalated.
+      expect(h.logger.take('ai.call.retry')).toMatchObject([
+        { level: 'warn', fields: { provider: 'receptionist', retry: 1, code: 'unavailable' } },
+        { level: 'warn', fields: { provider: 'receptionist', retry: 2, code: 'unavailable' } },
       ]);
+      expect(h.logger.take('ai.route.escalated')).toEqual([]);
     } finally {
-      await failover.close();
+      await resilient.close();
     }
   });
 
-  it('with escalation disabled, an outage ends the turn with a recoverable error and a retry reuses the unanswered message', async () => {
+  it('an outage the retries cannot bridge ends the turn with a recoverable error, and a retry reuses the unanswered message', async () => {
+    // Escalation stays enabled: an unavailable provider is still never a reason to use the premium model.
     const flaky = new FlakyModel('receptionist');
-    const noEscalation = await createAppHarness({
-      database: h.t,
-      logger: h.logger,
-      textProviders: { receptionist: flaky },
-      ai: { AI_ESCALATION_ENABLED: 'false' },
-    });
+    const outage = await createAppHarness({ database: h.t, logger: h.logger, textProviders: { receptionist: flaky } });
     try {
-      const session = await noEscalation.openSession(springfield.widgetKey);
+      const session = await outage.openSession(springfield.widgetKey);
 
-      const failed = await noEscalation.sendMessage(springfield.widgetKey, session.sessionToken, QUESTIONS.emergency);
+      const failed = await outage.sendMessage(springfield.widgetKey, session.sessionToken, QUESTIONS.emergency);
 
       expect(failed.events).toEqual([
         { type: 'turn.start', turnId: failed.turnId, conversationId: failed.conversationId },
         { type: 'turn.error', turnId: failed.turnId, code: 'provider_unavailable', message: anyString, recoverable: true },
       ]);
-      expect(noEscalation.requestsTo('escalation')).toEqual([]);
+      expect(flaky.requests).toHaveLength(3);
+      expect(outage.requestsTo('escalation')).toEqual([]);
       const conversationId = failed.conversationId;
       expect((await h.messages(organizationId, conversationId)).map(({ role, content, data }) => ({ role, content, data }))).toEqual([
         { role: 'user', content: QUESTIONS.emergency, data: {} },
@@ -220,14 +214,15 @@ describe('6. provider and model are chosen by configuration', () => {
       expect(await h.usage(organizationId, conversationId)).toEqual([]);
       expect(await h.conversation(organizationId, conversationId)).toMatchObject({ status: 'active', turnLockedUntil: null });
       // Operators see the outage as warnings.
-      expect(h.logger.take('agent.turn.provider_failed')).toMatchObject([
-        { level: 'warn', fields: { provider: 'receptionist', code: 'unavailable' } },
+      expect(h.logger.take('ai.call.retry')).toHaveLength(2);
+      expect(h.logger.take('ai.call.failed')).toMatchObject([
+        { level: 'warn', fields: { provider: 'receptionist', code: 'unavailable', attempts: 3 } },
       ]);
       expect(h.logger.take('webchat.turn_failed')).toMatchObject([{ level: 'warn', fields: { errorCode: 'provider_unavailable' } }]);
 
       // The provider recovers and the visitor presses Retry: the same text is answered, not duplicated.
       flaky.down = false;
-      const retried = await noEscalation.sendMessage(springfield.widgetKey, session.sessionToken, QUESTIONS.emergency);
+      const retried = await outage.sendMessage(springfield.widgetKey, session.sessionToken, QUESTIONS.emergency);
       expect(retried.conversationId).toBe(conversationId);
       expect(retried.reply).toContain(SPRINGFIELD_FACTS.emergency);
       expect((await h.messages(organizationId, conversationId)).map((message) => message.role)).toEqual([
@@ -239,7 +234,7 @@ describe('6. provider and model are chosen by configuration', () => {
       ]);
       expectPricedAs(chatRows(await h.usage(organizationId, conversationId)), 'receptionist-mini');
     } finally {
-      await noEscalation.close();
+      await outage.close();
     }
   });
 
@@ -269,21 +264,22 @@ describe('6. provider and model are chosen by configuration', () => {
         { type: 'turn.start', turnId: failed.turnId, conversationId: failed.conversationId },
         { type: 'turn.error', turnId: failed.turnId, code: 'provider_unavailable', message: anyString, recoverable: true },
       ]);
-      // The premium model never served (or billed) the turn.
+      // Neither retried nor sent to the premium model (which never served or billed the turn).
       expect(rejecting.requests.map(({ model }) => model)).toEqual(['receptionist-mni']);
       expect(misconfigured.requestsTo('escalation')).toEqual([]);
       expect(await h.usage(organizationId, failed.conversationId)).toEqual([]);
       // Operators get an error naming the rejected model.
-      expect(h.logger.take('agent.default_model.rejected')).toEqual([
+      expect(h.logger.take('ai.call.failed')).toEqual([
         {
           level: 'error',
-          event: 'agent.default_model.rejected',
-          fields: expect.objectContaining({ provider: 'receptionist', model: 'receptionist-mni', code: 'invalid_request', status: 404 }) as unknown,
+          event: 'ai.call.failed',
+          fields: expect.objectContaining({ provider: 'receptionist', model: 'receptionist-mni', code: 'invalid_request', status: 404, attempts: 1 }) as unknown,
         },
       ]);
-      expect(h.logger.take('agent.turn.escalated')).toEqual([]);
-      expect(h.logger.take('agent.turn.provider_failed')).toMatchObject([{ level: 'warn', fields: { code: 'invalid_request' } }]);
+      expect(h.logger.take('ai.route.escalated')).toEqual([]);
       expect(h.logger.take('webchat.turn_failed')).toMatchObject([{ level: 'warn', fields: { errorCode: 'provider_unavailable' } }]);
+      // The mistyped model also has no price: spend limits could not bound it, which startup reports as an error.
+      expect(h.logger.take('usage.pricing_missing')).toMatchObject([{ level: 'error', fields: { models: ['receptionist-mni'] } }]);
     } finally {
       await misconfigured.close();
     }

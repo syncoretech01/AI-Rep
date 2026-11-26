@@ -383,7 +383,12 @@ describe('4. refresh / reopen preserves the conversation as designed', () => {
         expect(summaryRequests[0]?.tools).toEqual([]);
         const summaryUsage = (await short.usage(organizationId, conversationId)).filter((row) => row.purpose === 'conversation_summary');
         expect(summaryUsage).toEqual([
-          like({ kind: 'text_generation', provider: 'receptionist', model: 'receptionist-mini', metadata: { tier: 'default' } }),
+          like({
+            kind: 'text_generation',
+            provider: 'receptionist',
+            model: 'receptionist-mini',
+            metadata: { tier: 'default', route: 'default' },
+          }),
         ]);
         expect(summaryUsage[0]?.costUsd).toBeGreaterThan(0);
         // It folded the oldest messages, through summary_through_seq: every visitor message up to it, none after it.
@@ -400,7 +405,13 @@ describe('4. refresh / reopen preserves the conversation as designed', () => {
         const requestsBefore = short.requestsTo('receptionist').length;
         const fourth = await short.sendMessage(tenant.widgetKey, session.sessionToken, STORY[3]!);
         const [request] = short.requestsTo('receptionist').slice(requestsBefore);
-        expect(request?.instructions).toContain(conversation!.summary);
+        // ...as user-role context (it derives from visitor messages), never inside the instructions.
+        expect(request?.input[0]).toEqual({
+          type: 'message',
+          role: 'user',
+          content: expect.stringContaining(conversation!.summary.replace(/\s+/g, ' ').trim()) as unknown,
+        });
+        expect(request?.instructions).not.toContain(conversation!.summary);
         expect(request?.input.at(-1)).toEqual({ type: 'message', role: 'user', content: STORY[3] });
         const resent = request?.input.flatMap((item) => (item.type === 'message' ? [item.content] : []));
         expect(resent).not.toContain(STORY[0]);

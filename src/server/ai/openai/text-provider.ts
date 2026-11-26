@@ -28,9 +28,12 @@ export interface OpenAIProviderOptions {
   apiKey?: string;
   /** Pre-built client (tests inject one with a stubbed fetch). */
   client?: OpenAI;
-  /** Overall deadline per call, including SDK retries and the streamed body (AI_REQUEST_TIMEOUT_MS). */
+  /** Overall deadline per call, including the streamed body (AI_REQUEST_TIMEOUT_MS). */
   timeoutMs: number;
-  /** SDK retries for connection errors, 429 and 5xx (default 2). */
+  /**
+   * SDK-internal retries (default 0). Retries are owned by the provider-neutral policy in src/server/ai/retry.ts,
+   * which honours the turn deadline, never repeats a partially streamed response and logs every attempt.
+   */
   maxRetries?: number;
   /** Provider id reported in results and errors (default 'openai'). */
   id?: string;
@@ -40,7 +43,7 @@ export function createOpenAIClient(options: OpenAIProviderOptions): OpenAI {
   if (options.client) return options.client;
   if (!options.apiKey) throw new Error('OpenAI provider requires an apiKey or a client');
   // `timeout` only bounds the wait for response headers; calls add an overall deadline (startProviderCall).
-  return new OpenAI({ apiKey: options.apiKey, timeout: options.timeoutMs, maxRetries: options.maxRetries ?? 2 });
+  return new OpenAI({ apiKey: options.apiKey, timeout: options.timeoutMs, maxRetries: options.maxRetries ?? 0 });
 }
 
 const tokenCount = z.number().nonnegative().catch(0);
@@ -84,6 +87,7 @@ export class OpenAITextProvider implements TextModelProvider {
     const startedAt = performance.now();
     let streamOpened = false;
     let text = '';
+    let firstTokenMs: number | undefined;
     try {
       const events = await this.client.responses.create(this.toParams(request), { signal: call.signal });
       streamOpened = true;
@@ -92,6 +96,7 @@ export class OpenAITextProvider implements TextModelProvider {
           case 'response.output_text.delta':
           case 'response.refusal.delta':
             if (event.delta) {
+              firstTokenMs ??= Math.round(performance.now() - startedAt);
               text += event.delta;
               yield { type: 'text.delta', delta: event.delta };
             }
@@ -99,10 +104,8 @@ export class OpenAITextProvider implements TextModelProvider {
           case 'response.completed':
           case 'response.incomplete': {
             const elapsedMs = Math.round(performance.now() - startedAt);
-            yield {
-              type: 'completed',
-              result: this.toResult(event.type, event.response, text, elapsedMs, request.model),
-            };
+            const result = this.toResult(event.type, event.response, text, elapsedMs, request.model);
+            yield { type: 'completed', result: firstTokenMs === undefined ? result : { ...result, firstTokenMs } };
             return;
           }
           case 'response.failed':

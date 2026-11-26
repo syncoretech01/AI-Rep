@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { Embedder } from '@/server/ai/embedder';
 import { ProviderError } from '@/server/ai/types';
+import { UsageLimitError } from '@/server/domain/usage/limits';
 import { EMBEDDING_DIMENSIONS } from '@/server/config/env';
 import type { ScopedDb } from '@/server/db/scope';
 import { jsonParam, maybeOne, one, toDate, toNumber, vectorParam } from '@/server/db/sql';
@@ -65,6 +66,7 @@ const INSERT_BATCH_SIZE = 32;
 const NO_TEXT_MESSAGE = 'No readable text found.';
 /** Exported so batch callers (the re-embed command) can stop on a provider outage. */
 export const EMBEDDING_UNAVAILABLE_MESSAGE = 'The embedding service is unavailable. Please try again later.';
+export const USAGE_LIMIT_MESSAGE = "The organization's AI usage limit has been reached. Please try again later.";
 const INVALID_EMBEDDINGS_MESSAGE = 'The embedding service returned an invalid result. Please try again later.';
 const PROCESSING_FAILED_MESSAGE = 'Processing failed.';
 const NOT_FOUND_MESSAGE = 'Knowledge source not found.';
@@ -329,6 +331,7 @@ async function failSource(db: ScopedDb, organizationId: string, sourceId: string
 
 function failureMessage(error: unknown): string {
   if (error instanceof ProviderError) return EMBEDDING_UNAVAILABLE_MESSAGE;
+  if (error instanceof UsageLimitError) return USAGE_LIMIT_MESSAGE;
   if (error instanceof IngestionError) return error.message;
   return PROCESSING_FAILED_MESSAGE;
 }
@@ -352,6 +355,8 @@ async function indexDocument(db: ScopedDb, embedder: Embedder, target: IndexTarg
     const fields = { organizationId: target.organizationId, sourceId: target.sourceId };
     if (error instanceof ProviderError) {
       logger.warn('knowledge.embedding_failed', { ...fields, provider: error.provider, code: error.code });
+    } else if (error instanceof UsageLimitError) {
+      logger.warn('knowledge.embedding_refused', { ...fields, scope: error.scope });
     } else {
       logger.error('knowledge.indexing_failed', { ...fields, error });
     }

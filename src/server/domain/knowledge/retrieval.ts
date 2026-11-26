@@ -114,6 +114,8 @@ export async function searchKnowledge(
     conversationId?: string | null;
     query: string;
     budget: RetrievalBudget;
+    /** Bounds the query embedding and its retries (the tool's time limit). */
+    signal?: AbortSignal;
   },
 ): Promise<RetrievedChunk[]> {
   const query = normalizeQuery(params.query);
@@ -124,6 +126,7 @@ export async function searchKnowledge(
     agentId: params.agentId,
     conversationId: params.conversationId ?? null,
     purpose: 'knowledge_query',
+    ...(params.signal && { signal: params.signal }),
   });
   const embedding = outcome.vectors[0];
   if (outcome.vectors.length !== 1 || embedding === undefined) {

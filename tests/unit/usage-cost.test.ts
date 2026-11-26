@@ -9,7 +9,14 @@ function usage(partial: Partial<TokenUsage>): TokenUsage {
 
 describe('pricing snapshot', () => {
   it('lists standard-tier prices for the configured default models', () => {
-    expect(PRICING_SNAPSHOT_DATE).toBe('2026-10-08');
+    // developers.openai.com/api/docs/pricing, checked 2026-11-26 (Standard tier, not the discounted Batch/Flex rates).
+    expect(PRICING_SNAPSHOT_DATE).toBe('2026-11-26');
+    expect(DEFAULT_MODEL_PRICING['gpt-6.2-sol']).toEqual({
+      inputPerMTok: 2,
+      cachedInputPerMTok: 0.1,
+      cacheWritePerMTok: 2.5,
+      outputPerMTok: 10,
+    });
     expect(DEFAULT_MODEL_PRICING['gpt-6-luna']).toEqual({
       inputPerMTok: 0.1,
       cachedInputPerMTok: 0.01,

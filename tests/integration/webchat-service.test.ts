@@ -479,6 +479,8 @@ describe('openMessageStream', () => {
       organizationId: tenant.org.id,
       agent: expect.objectContaining({ id: tenant.agent.id, organizationId: tenant.org.id }) as unknown,
       conversationId,
+      // The owner token of the turn lock the channel acquired: the runtime fences its writes with it.
+      lockToken: expect.stringMatching(/^[0-9a-f-]{36}$/) as unknown,
       channel: 'web_chat',
       userText: 'Do you fix boilers?',
       endUserId: createHash('sha256').update(visitorId).digest('hex').slice(0, 32),
@@ -1010,7 +1012,7 @@ describe('rate limits', () => {
     const h = harness({
       db: interleaved(/insert into public\.conversations/, async (sql) => {
         competing.id = (await createConversation(sql, tenant.org.id, tenant.agent.id, { visitorId })).id;
-        expect(await tryAcquireTurnLock(sql, tenant.org.id, competing.id, 60)).toBe(true);
+        expect(await tryAcquireTurnLock(sql, tenant.org.id, competing.id, 60)).not.toBeNull();
       }),
     });
     const session = await h.service.startSession({ widgetKey: tenant.widgetKey }, newClient());

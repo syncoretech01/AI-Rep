@@ -67,7 +67,7 @@ export interface ConversationListItem {
 export interface ToolRunRecord {
   id: string;
   toolName: string;
-  status: 'running' | 'succeeded' | 'failed' | 'rejected';
+  status: 'running' | 'succeeded' | 'failed' | 'rejected' | 'unknown';
   input: unknown;
   output: unknown;
   errorCode: string | null;

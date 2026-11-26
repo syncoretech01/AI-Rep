@@ -5,7 +5,7 @@ import type { Agent } from '@/server/domain/agents/types';
 import type { BusinessProfile } from '@/server/domain/business/types';
 import type { Message } from '@/server/domain/conversations/types';
 import type { Channel } from '@/server/domain/types';
-import { buildInstructions } from '../runtime/prompts';
+import { buildInstructions, summaryContextMessage } from '../runtime/prompts';
 import { toModelTools } from '../tools/registry';
 import type { ToolDefinition } from '../tools/types';
 
@@ -78,14 +78,16 @@ export function assembleContext(input: AssembleContextInput): AssembledContext {
     business: input.business,
     channel: input.channel,
     now: input.now,
-    summary,
     toolNames: input.tools.map((tool) => tool.name),
   });
   const history = input.history.flatMap((message) => historyEntry(message, budgets) ?? []);
+  // The summary comes from visitor messages: user-role context ahead of the history, never instructions.
+  const summaryMessage = summaryContextMessage(summary);
+  const items: ModelInputItem[] = summaryMessage ? [{ type: 'message', role: 'user', content: summaryMessage }] : [];
 
   return {
     instructions,
-    input: history.map((entry) => ({ type: 'message', role: entry.role, content: entry.content })),
+    input: [...items, ...history.map((entry): ModelInputItem => ({ type: 'message', role: entry.role, content: entry.content }))],
     tools: toModelTools(input.tools),
     stats: {
       instructionTokens: estimateTokens(instructions),

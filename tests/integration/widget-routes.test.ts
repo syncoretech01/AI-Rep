@@ -391,7 +391,7 @@ describe('widget API routes', () => {
     const conversationId = conversationIdOf(first.events);
 
     // Another request (e.g. a second tab) is mid-turn.
-    expect(await t.service.run((sql) => tryAcquireTurnLock(sql, tenant.org.id, conversationId, 60))).toBe(true);
+    expect(await t.service.run((sql) => tryAcquireTurnLock(sql, tenant.org.id, conversationId, 60))).not.toBeNull();
     await expectApiError(
       await postMessages(request('/api/widget/messages', { widgetKey: tenant.widgetKey, sessionToken: session.sessionToken, text: 'Hi' })),
       409,

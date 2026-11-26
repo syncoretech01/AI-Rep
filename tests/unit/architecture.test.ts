@@ -519,7 +519,7 @@ describe('the checks see the code base', () => {
 
   it('finds the configured model names, client modules and environment reads', () => {
     const configLiterals = MODULES.get('src/server/config/env.ts')?.literals.map((literal) => literal.text) ?? [];
-    expect(configLiterals).toEqual(expect.arrayContaining(['gpt-6-luna', 'gpt-6-sol', 'text-embedding-3-small']) as unknown);
+    expect(configLiterals).toEqual(expect.arrayContaining(['gpt-6-luna', 'gpt-6.2-sol', 'text-embedding-3-small']) as unknown);
     expect(MODULES.get('src/components/widget/ChatWidget.tsx')?.useClient).toBe(true);
     const closure = clientClosure(MODULES);
     expect(closure.get('src/shared/widget-protocol.ts')).toBeDefined();

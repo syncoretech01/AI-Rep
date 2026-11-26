@@ -47,6 +47,37 @@ describe('createLogger', () => {
     });
   });
 
+  it('redacts free text that can carry customer data, by exact key, as a backstop', () => {
+    const capture = captureLines();
+    createLogger().warn('agent.debug_mistake', {
+      name: 'Jane Doe',
+      address: '742 Evergreen Terrace',
+      content: 'My card number is ...',
+      text: 'visitor message',
+      summary: 'The visitor said ...',
+      query: 'boiler repair at 742 Evergreen',
+      arguments: { phone: 'x' },
+      transcript: ['...'],
+      toolName: 'captureLead',
+      route: 'default',
+      nested: { Name: 'Jane' },
+    });
+    const [line] = capture.lines();
+    expect(line).toMatchObject({
+      name: '[redacted]',
+      address: '[redacted]',
+      content: '[redacted]',
+      text: '[redacted]',
+      summary: '[redacted]',
+      query: '[redacted]',
+      arguments: '[redacted]',
+      transcript: '[redacted]',
+      toolName: 'captureLead',
+      route: 'default',
+      nested: { Name: '[redacted]' },
+    });
+  });
+
   it('respects the minimum level and child bindings', () => {
     const capture = captureLines();
     const logger = createLogger({ level: 'warn', bindings: { service: 'test' } }).child({ requestId: 'r1' });

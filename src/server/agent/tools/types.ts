@@ -27,6 +27,11 @@ export interface ToolContext {
   readonly embedder: Embedder;
   readonly retrieval: RetrievalBudget;
   readonly signal?: AbortSignal;
+  /**
+   * For sideEffects:'external' tools: the durable identity of this operation. Pass `key` to the provider as
+   * its idempotency key where the provider supports one.
+   */
+  readonly operation?: { readonly id: string; readonly key: string; readonly attempt: number };
 }
 
 export type ToolFailureCode =
@@ -36,7 +41,13 @@ export type ToolFailureCode =
   | 'missing_information'
   | 'not_found'
   | 'unavailable'
-  | 'failed';
+  | 'failed'
+  /** A per-turn limit refused the call (e.g. AI_MAX_TOOL_CALLS_PER_TURN). */
+  | 'limit_reached'
+  /** The same external operation is being executed right now (another claim holds it). */
+  | 'in_progress'
+  /** An external operation was sent but its result is not confirmed: it must not be repeated or reported as done. */
+  | 'outcome_unknown';
 
 export interface ToolFailure {
   code: ToolFailureCode;
@@ -46,9 +57,24 @@ export interface ToolFailure {
   details?: Record<string, unknown>;
 }
 
-export type ToolOutcome<TData> = { ok: true; data: TData } | { ok: false; error: ToolFailure };
+/**
+ * What an external handler knows about a failure. Default 'failed' (the provider refused it). 'not_attempted':
+ * nothing was sent. 'unknown': it may have been executed (e.g. a timeout after sending) — never retried blindly.
+ */
+export type ExternalFailureOutcome = 'not_attempted' | 'failed' | 'unknown';
 
-export type ToolSideEffects = 'none' | 'writes';
+export type ToolOutcome<TData> =
+  | { ok: true; data: TData; /** Provider-side id of an external operation (e.g. a message id). */ externalReference?: string }
+  | { ok: false; error: ToolFailure; outcome?: ExternalFailureOutcome };
+
+/**
+ * - none: read-only.
+ * - writes: transactional writes to our own database (atomic: a failure means nothing was written).
+ * - external: calls a third party (SMS, calendar, CRM). Executed under a durable operation record
+ *   (app_private.tool_operations): one execution per operation identity, success replayed, an unconfirmed
+ *   outcome held for reconciliation instead of being repeated.
+ */
+export type ToolSideEffects = 'none' | 'writes' | 'external';
 
 /**
  * - `none`: safe to repeat (read-only tools).
@@ -56,6 +82,7 @@ export type ToolSideEffects = 'none' | 'writes';
  *   normalized arguments) is replayed instead of executed again; after a different call (A, B, A) it runs again.
  */
 export type ToolIdempotency = 'none' | 'conversation_arguments';
+// External tools are always idempotent per operation identity (see operationKey); 'idempotency' governs internal writes.
 
 export interface ToolDefinition<TSchema extends z.ZodType = z.ZodType, TData = unknown> {
   /** Stable name exposed to models. Never rename once shipped. */
@@ -73,6 +100,11 @@ export interface ToolDefinition<TSchema extends z.ZodType = z.ZodType, TData = u
    * outcome (and audit) is recorded truthfully; it must bound its own I/O (DB statement/connection timeouts do).
    */
   readonly timeoutMs?: number;
+  /**
+   * External tools only: the operation identity (default: conversation + tool + normalized arguments). Two calls
+   * with the same identity are the same operation: it executes at most once successfully.
+   */
+  operationKey?(input: z.output<TSchema>, context: ToolContext): string;
   handler(input: z.output<TSchema>, context: ToolContext): Promise<ToolOutcome<TData>>;
 }
 

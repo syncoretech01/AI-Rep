@@ -98,6 +98,8 @@ export interface TextGenerationResult {
   finishReason: FinishReason;
   usage: TokenUsage;
   durationMs: number;
+  /** Time from sending the request to the first streamed output text, when any text streamed. */
+  firstTokenMs?: number;
 }
 
 export type TextStreamEvent =
@@ -142,12 +144,17 @@ export type ProviderErrorCode =
   | 'aborted'
   | 'unknown';
 
-/** Normalized provider failure. Adapters translate SDK errors into this. */
+/**
+ * Normalized provider failure. Adapters translate SDK errors into this. `retryable` means repeating the same
+ * request unchanged may succeed (rate limit, timeout, outage); see src/server/ai/retry.ts for the policy.
+ */
 export class ProviderError extends Error {
   readonly provider: string;
   readonly code: ProviderErrorCode;
   readonly retryable: boolean;
   readonly status: number | undefined;
+  /** How long the provider asked callers to wait before retrying (Retry-After), when it said so. */
+  readonly retryAfterMs: number | undefined;
 
   constructor(init: {
     provider: string;
@@ -155,6 +162,7 @@ export class ProviderError extends Error {
     message: string;
     retryable: boolean;
     status?: number;
+    retryAfterMs?: number;
     cause?: unknown;
   }) {
     super(init.message, { cause: init.cause });
@@ -163,5 +171,6 @@ export class ProviderError extends Error {
     this.code = init.code;
     this.retryable = init.retryable;
     this.status = init.status;
+    this.retryAfterMs = init.retryAfterMs;
   }
 }

@@ -14,5 +14,9 @@ export interface EmbedOutcome {
 export interface Embedder {
   /** The embedding model currently configured (used to filter stored chunks). */
   readonly model: string;
-  embed(texts: readonly string[], context: UsageContext & { purpose: EmbeddingUsagePurpose }): Promise<EmbedOutcome>;
+  /** `signal` bounds the call and its retries (e.g. the tool's time limit, which follows the turn deadline). */
+  embed(
+    texts: readonly string[],
+    context: UsageContext & { purpose: EmbeddingUsagePurpose; signal?: AbortSignal },
+  ): Promise<EmbedOutcome>;
 }

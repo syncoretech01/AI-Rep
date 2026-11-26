@@ -3,7 +3,8 @@
  * transport — the web chat channel maps them to widget SSE events.
  */
 
-export type AgentErrorCode = 'provider_unavailable' | 'internal';
+/** limit_reached: an organization spend limit or the conversation-length limit refused the turn. */
+export type AgentErrorCode = 'provider_unavailable' | 'limit_reached' | 'internal';
 
 export type AgentEvent =
   | { type: 'turn.start'; turnId: string; conversationId: string }

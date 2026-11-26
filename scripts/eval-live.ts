@@ -15,7 +15,8 @@
  *   3. name + phone are captured as a lead through the captureLead tool;
  *   4. reopening the widget with the stored session token restores the same conversation;
  *   5. one tenant cannot retrieve another tenant's knowledge;
- *   6. usage is metered on the configured provider/model (change AI_TEXT_MODEL etc. and re-run to compare).
+ *   6. usage is metered on the configured provider/model (change AI_TEXT_MODEL etc. and re-run to compare);
+ *   7. a model id the provider rejects fails at once: one attempt, no retry, no escalation (failure behaviour).
  * The exit code is 1 when any check fails or the configuration is incomplete.
  */
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -552,6 +553,37 @@ export async function runLiveEvaluation(options: LiveEvaluationOptions): Promise
       check('every priced call has tokens and an estimated cost', unmetered.length === 0, unmetered.map((row) => `${row.purpose} ${row.model}`).join(', ') || undefined),
     ]);
     report.costUsd = totalCost(usage);
+
+    // 7. Failure behaviour: a request the provider rejects fails fast (no retries, never the premium model).
+    print('\n== 7. A model id the provider rejects fails at once, without retries or escalation ==');
+    const events: Array<{ event: string; fields: Record<string, unknown> }> = [];
+    const capturing: Logger = {
+      debug: (event, fields) => logger.debug(event, fields),
+      info: (event, fields) => logger.info(event, fields),
+      warn: (event, fields = {}) => events.push({ event, fields }),
+      error: (event, fields = {}) => events.push({ event, fields }),
+      child: () => capturing,
+    };
+    const rejecting = createServices({
+      db,
+      logger: capturing,
+      ai: { ...ai, text: { ...ai.text, model: 'live-validation-model-that-does-not-exist' } },
+      providers,
+      widget: loadWidgetConfig({ WIDGET_SESSION_SECRET: randomBytes(32).toString('base64url') }),
+    });
+    const rejectedSession = await rejecting.webChat.startSession({ widgetKey: home.widgetKey }, { ip: '203.0.113.77' });
+    const rejected = await visitorTurn(rejecting, home.widgetKey, rejectedSession.sessionToken, 'Hello there', '203.0.113.77');
+    const failures = events.filter((entry) => entry.event === 'ai.call.failed');
+    print(`  turn   ${rejected.error ?? 'no error'}`);
+    record([
+      check('the turn ends with a recoverable provider error', rejected.error?.startsWith('provider_unavailable') === true, rejected.error ?? undefined),
+      check(
+        'one attempt, reported as an alert',
+        failures.length === 1 && failures[0]?.fields.attempts === 1,
+        failures.map((entry) => `${String(entry.fields.code)} attempts=${String(entry.fields.attempts)}`).join(', ') || undefined,
+      ),
+      check('no retry and no escalation', !events.some((entry) => entry.event === 'ai.call.retry' || entry.event === 'ai.route.escalated')),
+    ]);
   } finally {
     await db.close();
   }

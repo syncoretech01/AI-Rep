@@ -2,12 +2,15 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Sql } from '@/server/db/types';
 import {
+  TurnLockLostError,
   appendMessage,
   closeConversation,
+  countUserMessages,
   getActiveVisitorConversation,
   getConversation,
   getConversationDetail,
   getOrCreateVisitorConversation,
+  holdsTurnLock,
   listConversations,
   listMessages,
   listRecentTextMessages,
@@ -335,29 +338,79 @@ describe('messages', () => {
 });
 
 describe('turn lock', () => {
-  it('lets one turn hold the conversation at a time', async () => {
+  const expire = (conversationId: string) =>
+    t.db.query(`update public.conversations set turn_locked_until = now() - interval '1 second' where id = $1`, [conversationId]);
+
+  it('lets one turn hold the conversation at a time, with a unique owner token per acquisition', async () => {
     const tenant = await newTenant();
     const conversationId = await newConversation(tenant);
     const acquire = () => t.service.run((sql) => tryAcquireTurnLock(sql, tenant.org.id, conversationId, 120));
-    const release = () => t.service.run((sql) => releaseTurnLock(sql, tenant.org.id, conversationId));
+    const release = (token: string) => t.service.run((sql) => releaseTurnLock(sql, tenant.org.id, conversationId, token));
 
-    expect(await acquire()).toBe(true);
-    const lock = await t.db.query<{ held: boolean }>(
-      `select turn_locked_until > now() + interval '100 seconds' as held from public.conversations where id = $1`,
+    const first = await acquire();
+    expect(first).toMatch(/^[0-9a-f-]{36}$/);
+    const lock = await t.db.query<{ held: boolean; token: string }>(
+      `select turn_locked_until > now() + interval '100 seconds' as held, turn_lock_token as token
+       from public.conversations where id = $1`,
       [conversationId],
     );
-    expect(lock[0]?.held).toBe(true);
-    expect(await acquire()).toBe(false);
+    expect(lock[0]).toEqual({ held: true, token: first });
+    expect(await acquire()).toBeNull();
 
-    await release();
-    expect(await acquire()).toBe(true);
+    expect(await release(first!)).toBe(true);
+    const second = await acquire();
+    expect(second).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second).not.toBe(first);
 
-    // A lock left behind by a crashed turn expires.
-    await t.db.query(`update public.conversations set turn_locked_until = now() - interval '1 second' where id = $1`, [
-      conversationId,
-    ]);
-    expect(await acquire()).toBe(true);
-    expect(await acquire()).toBe(false);
+    // A lock left behind by a crashed turn expires and can be taken over.
+    await expire(conversationId);
+    expect(await acquire()).not.toBeNull();
+    expect(await acquire()).toBeNull();
+  });
+
+  it('only the owner releases: an expired owner cannot free the lock of the turn that took over', async () => {
+    const tenant = await newTenant();
+    const conversationId = await newConversation(tenant);
+    const acquire = () => t.service.run((sql) => tryAcquireTurnLock(sql, tenant.org.id, conversationId, 120));
+    const release = (token: string) => t.service.run((sql) => releaseTurnLock(sql, tenant.org.id, conversationId, token));
+
+    const stale = (await acquire())!;
+    await expire(conversationId);
+    const current = (await acquire())!;
+
+    expect(await release(stale)).toBe(false);
+    expect(await acquire()).toBeNull(); // still held by `current`
+    expect(await t.service.run((sql) => holdsTurnLock(sql, tenant.org.id, conversationId, current))).toBe(true);
+    expect(await t.service.run((sql) => holdsTurnLock(sql, tenant.org.id, conversationId, stale))).toBe(false);
+    expect(await release('not-a-uuid')).toBe(false);
+    expect(await release(current)).toBe(true);
+  });
+
+  it('fences writes: a stale worker cannot append to a conversation another worker owns', async () => {
+    const tenant = await newTenant();
+    const conversationId = await newConversation(tenant);
+    const acquire = () => t.service.run((sql) => tryAcquireTurnLock(sql, tenant.org.id, conversationId, 120));
+    const append = (lockToken: string) =>
+      t.service.run((sql) =>
+        appendMessage(sql, tenant.org.id, conversationId, { role: 'assistant', content: 'Hi' }, { lockToken }),
+      );
+
+    const stale = (await acquire())!;
+    await expect(append(stale)).resolves.toMatchObject({ role: 'assistant' });
+    await expire(conversationId);
+    const current = (await acquire())!;
+
+    await expect(append(stale)).rejects.toBeInstanceOf(TurnLockLostError);
+    await expect(append('not-a-uuid')).rejects.toBeInstanceOf(TurnLockLostError);
+    await expect(append(current)).resolves.toMatchObject({ role: 'assistant' });
+    // A missing conversation is still "not found", fenced or not.
+    await expect(
+      t.service.run((sql) =>
+        appendMessage(sql, tenant.org.id, randomUUID(), { role: 'user', content: 'x' }, { lockToken: current }),
+      ),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    const messages = await t.service.run((sql) => listMessages(sql, tenant.org.id, conversationId));
+    expect(messages).toHaveLength(2);
   });
 
   it('cannot be taken or released through another organization', async () => {
@@ -365,10 +418,24 @@ describe('turn lock', () => {
     const tenantB = await newTenant();
     const conversationId = await newConversation(tenantA);
 
-    expect(await t.service.run((sql) => tryAcquireTurnLock(sql, tenantB.org.id, conversationId, 120))).toBe(false);
-    expect(await t.service.run((sql) => tryAcquireTurnLock(sql, tenantA.org.id, conversationId, 120))).toBe(true);
-    await t.service.run((sql) => releaseTurnLock(sql, tenantB.org.id, conversationId));
-    expect(await t.service.run((sql) => tryAcquireTurnLock(sql, tenantA.org.id, conversationId, 120))).toBe(false);
+    expect(await t.service.run((sql) => tryAcquireTurnLock(sql, tenantB.org.id, conversationId, 120))).toBeNull();
+    const token = await t.service.run((sql) => tryAcquireTurnLock(sql, tenantA.org.id, conversationId, 120));
+    expect(token).not.toBeNull();
+    expect(await t.service.run((sql) => releaseTurnLock(sql, tenantB.org.id, conversationId, token!))).toBe(false);
+    expect(await t.service.run((sql) => tryAcquireTurnLock(sql, tenantA.org.id, conversationId, 120))).toBeNull();
+  });
+
+  it('counts visitor messages for the conversation-length limit', async () => {
+    const tenant = await newTenant();
+    const other = await newTenant();
+    const conversationId = await newConversation(tenant);
+    const append = (role: 'user' | 'assistant') =>
+      t.service.run((sql) => appendMessage(sql, tenant.org.id, conversationId, { role, content: role }));
+    await append('user');
+    await append('assistant');
+    await append('user');
+    expect(await t.service.run((sql) => countUserMessages(sql, tenant.org.id, conversationId))).toBe(2);
+    expect(await t.service.run((sql) => countUserMessages(sql, other.org.id, conversationId))).toBe(0);
   });
 
   it('rejects a non-positive ttl', async () => {

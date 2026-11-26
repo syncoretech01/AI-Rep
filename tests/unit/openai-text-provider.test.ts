@@ -380,6 +380,7 @@ describe('OpenAITextProvider streaming results', () => {
       finishReason: 'stop',
       usage: { inputTokens: 120, cachedInputTokens: 40, cacheWriteTokens: 10, outputTokens: 30, reasoningTokens: 7 },
       durationMs: expect.any(Number) as number,
+      firstTokenMs: expect.any(Number) as number,
     });
   });
 
@@ -603,11 +604,12 @@ describe('OpenAITextProvider construction', () => {
     expect(new OpenAITextProvider({ apiKey: 'sk-test', timeoutMs: 1_000 }).id).toBe('openai');
   });
 
-  it('builds the SDK client with the request timeout and two retries unless one is injected', () => {
+  it('builds the SDK client with the request timeout and NO SDK retries (the retry policy owns them) unless injected', () => {
+    // The SDK would also retry quota 429s and ignore the turn deadline; src/server/ai/retry.ts decides instead.
     const client = createOpenAIClient({ apiKey: 'sk-test', timeoutMs: 12_345 });
     expect(client.timeout).toBe(12_345);
-    expect(client.maxRetries).toBe(2);
-    expect(createOpenAIClient({ apiKey: 'sk-test', timeoutMs: 1_000, maxRetries: 0 }).maxRetries).toBe(0);
+    expect(client.maxRetries).toBe(0);
+    expect(createOpenAIClient({ apiKey: 'sk-test', timeoutMs: 1_000, maxRetries: 1 }).maxRetries).toBe(1);
     expect(createOpenAIClient({ client, timeoutMs: 1_000 })).toBe(client);
   });
 });

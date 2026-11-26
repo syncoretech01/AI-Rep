@@ -45,7 +45,10 @@ import { signWidgetSession, verifyWidgetSession } from './session-token';
  */
 
 const CHANNEL: Channel = 'web_chat';
-/** Longer than the runtime's turn deadline and the route's maxDuration, so a live turn never loses its lock. */
+/**
+ * Longer than the runtime's turn deadline and the route's maxDuration, so a live turn never loses its lock. If one
+ * ever did, its owner token stops it: it can neither release the next turn's lock nor write into the conversation.
+ */
 export const TURN_LOCK_TTL_SECONDS = 120;
 /**
  * Post-turn work (rolling summary) must finish within this many ms of the request start, inside the messages
@@ -147,7 +150,8 @@ function toWidgetEvent(event: AgentEvent): WidgetEvent {
       return {
         type: 'turn.error',
         turnId: event.turnId,
-        code: event.code === 'provider_unavailable' ? 'provider_unavailable' : 'internal',
+        // The widget protocol has no separate limit code: a limit reads as "unavailable", with its own message.
+        code: event.code === 'internal' ? 'internal' : 'provider_unavailable',
         message: event.message,
         recoverable: event.recoverable,
       };
@@ -200,10 +204,19 @@ export function createWebChatService(deps: WebChatServiceDeps): WebChatService {
     return enforceLimit('session', `webchat:session:${ipHash}`, limit, { ipHash });
   }
 
-  /** Never throws: a lock that cannot be released expires after TURN_LOCK_TTL_SECONDS. */
-  async function releaseLock(organizationId: string, conversationId: string, fields: Record<string, string>): Promise<void> {
+  /**
+   * Never throws: a lock that cannot be released expires after TURN_LOCK_TTL_SECONDS. Only the owner token
+   * releases it, so a turn that outlived its lock never frees a newer turn's lock.
+   */
+  async function releaseLock(
+    organizationId: string,
+    conversationId: string,
+    token: string,
+    fields: Record<string, string>,
+  ): Promise<void> {
     try {
-      await service.run((sql) => releaseTurnLock(sql, organizationId, conversationId));
+      const released = await service.run((sql) => releaseTurnLock(sql, organizationId, conversationId, token));
+      if (!released) logger.warn('webchat.turn_lock_lost', fields);
     } catch (error) {
       logger.error('webchat.turn_lock_release_failed', { ...fields, error });
     }
@@ -257,7 +270,7 @@ export function createWebChatService(deps: WebChatServiceDeps): WebChatService {
     input: ChatTurnInput,
     requestStartedAt: number,
   ): { stream: ReadableStream<Uint8Array>; done: Promise<void> } {
-    const { organizationId, agent, conversationId } = input;
+    const { organizationId, agent, conversationId, lockToken } = input;
     const encoder = new TextEncoder();
     let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
     let open = true;
@@ -301,7 +314,7 @@ export function createWebChatService(deps: WebChatServiceDeps): WebChatService {
       }
       if (outcome?.status === 'failed') logger.warn('webchat.turn_failed', { ...fields, errorCode: outcome.errorCode });
 
-      await releaseLock(organizationId, conversationId, fields);
+      await releaseLock(organizationId, conversationId, lockToken, fields);
       // The visitor must always see an end to the reply, whatever the runtime did.
       deliver(
         terminal ?? {
@@ -410,35 +423,40 @@ export function createWebChatService(deps: WebChatServiceDeps): WebChatService {
         if (!conversation) return null;
         return {
           id: conversation.id,
-          locked: await tryAcquireTurnLock(sql, organizationId, conversation.id, TURN_LOCK_TTL_SECONDS),
+          lockToken: await tryAcquireTurnLock(sql, organizationId, conversation.id, TURN_LOCK_TTL_SECONDS),
         };
       });
-      if (active && !active.locked) throw conversationBusy({ ...scope, conversationId: active.id });
+      if (active && active.lockToken === null) throw conversationBusy({ ...scope, conversationId: active.id });
 
       try {
         await enforceLimit('widget', `webchat:widget:${channel.id}`, widget.rateLimits.widgetPerMinute, scope);
         await enforceLimit('organization', `webchat:org:${organizationId}`, widget.rateLimits.organizationPerMinute, scope);
       } catch (error) {
         // No turn runs: the conversation must be free for the visitor's next message.
-        if (active) await releaseLock(organizationId, active.id, { ...scope, conversationId: active.id });
+        if (active?.lockToken) {
+          await releaseLock(organizationId, active.id, active.lockToken, { ...scope, conversationId: active.id });
+        }
         throw error;
       }
 
       let conversationId: string;
-      if (active) {
+      let lockToken: string;
+      if (active?.lockToken) {
         conversationId = active.id;
+        lockToken = active.lockToken;
       } else {
         const opened = await service.run(async (sql) => {
           const conversation = await getOrCreateVisitorConversation(sql, { ...visitor, channel: CHANNEL });
           return {
             id: conversation.id,
-            locked: await tryAcquireTurnLock(sql, organizationId, conversation.id, TURN_LOCK_TTL_SECONDS),
+            lockToken: await tryAcquireTurnLock(sql, organizationId, conversation.id, TURN_LOCK_TTL_SECONDS),
           };
         });
         // Only when first messages of this visitor race (e.g. from two tabs): the other one opened the
         // conversation and runs its turn. This one was charged without a turn, within its per-IP limit.
-        if (!opened.locked) throw conversationBusy({ ...scope, conversationId: opened.id });
+        if (opened.lockToken === null) throw conversationBusy({ ...scope, conversationId: opened.id });
         conversationId = opened.id;
+        lockToken = opened.lockToken;
       }
 
       return streamTurn(
@@ -446,6 +464,7 @@ export function createWebChatService(deps: WebChatServiceDeps): WebChatService {
           organizationId,
           agent,
           conversationId,
+          lockToken,
           channel: CHANNEL,
           userText: text,
           endUserId: endUserIdFor(visitorId),

@@ -37,6 +37,10 @@ export interface AgentChannel {
   enabled: boolean;
   /** Public widget key (web chat). Not a secret. */
   publicKey: string | null;
+  /** Sites allowed to embed the widget (CSP frame-ancestors). Not authentication. */
+  allowedOrigins: string[];
+  /** Whether a list is configured at all: configured but empty after validation means "no site", not "any site". */
+  allowedOriginsConfigured: boolean;
   createdAt: Date;
   updatedAt: Date;
 }

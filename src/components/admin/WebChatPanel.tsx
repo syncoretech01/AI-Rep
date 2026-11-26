@@ -9,6 +9,7 @@ import { SubmitButton } from './SubmitButton';
 import { Badge, buttonClass, cx, linkClass } from './ui';
 import { useActionForm } from './use-action-form';
 
+const NEWLINE = String.fromCharCode(10);
 const ROTATE_CONFIRMATION =
   'Issue a new widget key? On websites using the current embed code, the chat shows as unavailable until you update the code.';
 
@@ -72,25 +73,66 @@ function RotateKeyForm({ action }: { action: FormAction }) {
   );
 }
 
-/** Publishing state, widget key and embed code of an agent's web chat. */
+function AllowedSitesForm({ origins, readOnly, action }: { origins: readonly string[]; readOnly: boolean; action: FormAction }) {
+  const { state, pending, formRef, formProps } = useActionForm(action);
+  return (
+    <div>
+      <label htmlFor="allowed-origins" className="block text-sm font-medium text-slate-800">
+        Allowed websites
+      </label>
+      <p id="allowed-origins-hint" className="mt-0.5 text-xs text-slate-500">
+        One per line, e.g. https://www.example.com or https://*.example.com. Browsers show the chat only on these
+        sites; leave empty to allow any site. This limits embedding, it does not authenticate visitors.
+      </p>
+      {readOnly ? (
+        <p className="mt-1.5 text-sm text-slate-700">{origins.length === 0 ? 'Any website' : origins.join(', ')}</p>
+      ) : (
+        <form ref={formRef} {...formProps} className="mt-1.5 space-y-2">
+          <textarea
+            id="allowed-origins"
+            name="allowedOrigins"
+            rows={3}
+            defaultValue={origins.join(NEWLINE)}
+            aria-describedby="allowed-origins-hint"
+            spellCheck={false}
+            className={cx(inputClass, 'font-mono')}
+          />
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <SubmitButton pending={pending} pendingLabel="Saving…" variant="secondary">
+              Save websites
+            </SubmitButton>
+            <FormMessage state={state} />
+          </div>
+        </form>
+      )}
+    </div>
+  );
+}
+
+/** Publishing state, widget key, embed code and allowed websites of an agent's web chat. */
 export function WebChatPanel({
   enabled,
   widgetKey,
   origin,
+  allowedOrigins,
   agentActive,
   readOnly,
   toggleAction,
   rotateAction,
+  sitesAction,
 }: {
   enabled: boolean;
   /** null when the agent has no web chat channel yet (publishing creates it). */
   widgetKey: string | null;
   /** Public origin of this app, e.g. https://app.example.com; null when it cannot be determined. */
   origin: string | null;
+  /** Sites allowed to embed the widget; empty = any site. */
+  allowedOrigins: readonly string[];
   agentActive: boolean;
   readOnly: boolean;
   toggleAction: FormAction;
   rotateAction: FormAction;
+  sitesAction: FormAction;
 }) {
   const snippet =
     origin && widgetKey ? `<script src="${origin}/embed.js" data-widget-key="${widgetKey}" async></script>` : null;
@@ -172,6 +214,8 @@ export function WebChatPanel({
               Conversations.
             </p>
           </div>
+
+          <AllowedSitesForm origins={allowedOrigins} readOnly={readOnly} action={sitesAction} />
         </>
       )}
     </div>

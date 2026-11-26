@@ -8,11 +8,13 @@ import { createToolRegistry, type ToolRegistry } from '@/server/agent/tools/regi
 import type { Embedder } from '@/server/ai/embedder';
 import { EmbeddingService } from '@/server/ai/embedding-service';
 import { createProviderRegistry, type ProviderFactories } from '@/server/ai/registry';
+import type { RetryOptions } from '@/server/ai/retry';
 import { ModelRouter } from '@/server/ai/router';
 import { createWebChatService, type WebChatService } from '@/server/channels/webchat/service';
 import type { AiConfig, WidgetConfig } from '@/server/config/env';
 import type { Database } from '@/server/db/types';
 import { createCostEstimator } from '@/server/domain/usage/cost';
+import { createUsageGuard, type UsageGuard } from '@/server/domain/usage/limits';
 import { createUsageRecorder } from '@/server/domain/usage/service';
 import type { UsageRecorder } from '@/server/domain/usage/types';
 import type { Logger } from '@/server/observability/logger';
@@ -30,6 +32,8 @@ export interface AppServices {
   router: ModelRouter;
   embedder: Embedder;
   usage: UsageRecorder;
+  /** Organization spend and conversation limits. */
+  guard: UsageGuard;
   tools: ToolRegistry;
   toolExecutor: ToolExecutor;
   runChatTurn: (input: ChatTurnInput, emit: AgentEventSink) => Promise<ChatTurnOutcome>;
@@ -43,14 +47,35 @@ export interface CreateServicesOptions {
   providers: ProviderFactories;
   widget: WidgetConfig;
   now?: () => Date;
+  /** Test seam: jitter, waiting and clock of the provider retry policy. */
+  retryEnvironment?: Pick<RetryOptions, 'random' | 'sleep' | 'clock'>;
 }
 
 export function createServices(options: CreateServicesOptions): AppServices {
-  const { db, logger, ai, widget, now } = options;
+  const { db, logger, ai, widget, now, retryEnvironment } = options;
   // Throws on a provider id that is configured but not registered: misconfiguration fails at startup.
   const router = new ModelRouter(ai, createProviderRegistry(options.providers));
-  const usage = createUsageRecorder({ db, costs: createCostEstimator(ai.pricingOverrides), logger });
-  const embedder = new EmbeddingService({ router, usage, logger });
+  const costs = createCostEstimator(ai.pricingOverrides);
+  const usage = createUsageRecorder({ db, costs, logger, pricingVersion: ai.pricingVersion });
+  const guard = createUsageGuard({
+    db,
+    costs,
+    logger,
+    defaults: {
+      dailySpendUsd: ai.spendLimits.dailyUsd,
+      monthlySpendUsd: ai.spendLimits.monthlyUsd,
+      maxConversationTurns: ai.budgets.maxConversationTurns,
+    },
+  });
+  // An unpriced model is metered at $0, so spend limits cannot bound it: say so loudly at startup.
+  const unpriced = [ai.text.model, ...(ai.escalation.enabled ? [ai.escalation.model] : [])].filter(
+    (model) => !costs.text(model, { inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, reasoningTokens: 0 }).known,
+  );
+  if (!costs.embedding(ai.embedding.model, 1).known) unpriced.push(ai.embedding.model);
+  if (unpriced.length > 0) {
+    logger.error('usage.pricing_missing', { models: unpriced, hint: 'add them to AI_MODEL_PRICING_JSON; spend limits cannot bound unpriced models' });
+  }
+  const embedder = new EmbeddingService({ router, usage, guard, retry: ai.retry, retryEnvironment, logger });
   const tools = createToolRegistry(phase1Tools);
   const toolExecutor = createToolExecutor({
     db,
@@ -64,7 +89,7 @@ export function createServices(options: CreateServicesOptions): AppServices {
     logger,
   });
 
-  const runtime: ChatRuntimeDeps = { db, router, tools, executor: toolExecutor, usage, ai, logger, now };
+  const runtime: ChatRuntimeDeps = { db, router, tools, executor: toolExecutor, usage, guard, ai, logger, now, retryEnvironment };
   const runTurn = (input: ChatTurnInput, emit: AgentEventSink) => runChatTurn(runtime, input, emit);
 
   const webChat = createWebChatService({
@@ -75,9 +100,9 @@ export function createServices(options: CreateServicesOptions): AppServices {
     runTurn,
     // Rolling summary after each completed turn; it logs and swallows its own failures.
     afterTurn: async (params) => {
-      await updateRollingSummary({ db, router, usage, ai, logger }, params);
+      await updateRollingSummary({ db, router, usage, guard, ai, logger }, params);
     },
   });
 
-  return { db, logger, ai, router, embedder, usage, tools, toolExecutor, runChatTurn: runTurn, webChat };
+  return { db, logger, ai, router, embedder, usage, guard, tools, toolExecutor, runChatTurn: runTurn, webChat };
 }

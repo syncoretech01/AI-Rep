@@ -3,7 +3,14 @@ import { jsonParam, maybeOne, one, toDate } from '@/server/db/sql';
 import type { Sql } from '@/server/db/types';
 import { DomainError, type Channel } from '@/server/domain/types';
 import { WIDGET_KEY_PATTERN } from '@/shared/widget-protocol';
-import { DEFAULT_AGENT_SETTINGS, agentSettingsSchema, parseLeadCapture, type AgentSettings } from './schemas';
+import {
+  DEFAULT_AGENT_SETTINGS,
+  agentSettingsSchema,
+  hasAllowedOriginsList,
+  parseAllowedOrigins,
+  parseLeadCapture,
+  type AgentSettings,
+} from './schemas';
 import type { Agent, AgentChannel, AgentStatus } from './types';
 import { generateWidgetKey } from './widget-key';
 
@@ -23,7 +30,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const AGENT_COLUMNS =
   'id, organization_id, name, status, greeting, language, timezone, instructions, lead_capture, created_at, updated_at';
-const CHANNEL_COLUMNS = 'id, organization_id, agent_id, channel, enabled, public_key, created_at, updated_at';
+const CHANNEL_COLUMNS = 'id, organization_id, agent_id, channel, enabled, public_key, config, created_at, updated_at';
 
 interface AgentRow {
   id: string;
@@ -46,6 +53,7 @@ interface ChannelRow {
   channel: Channel;
   enabled: boolean;
   public_key: string | null;
+  config: unknown;
   created_at: Date | string;
   updated_at: Date | string;
 }
@@ -55,6 +63,7 @@ interface PublishedWidgetRow extends AgentRow {
   channel: Channel;
   enabled: boolean;
   public_key: string | null;
+  config: unknown;
   channel_created_at: Date | string;
   channel_updated_at: Date | string;
 }
@@ -104,6 +113,8 @@ function mapChannel(row: ChannelRow): AgentChannel {
     channel: row.channel,
     enabled: row.enabled,
     publicKey: row.public_key,
+    allowedOrigins: parseAllowedOrigins(row.config),
+    allowedOriginsConfigured: hasAllowedOriginsList(row.config),
     createdAt: toDate(row.created_at),
     updatedAt: toDate(row.updated_at),
   };
@@ -269,6 +280,28 @@ export async function rotateWidgetKey(sql: Sql, organizationId: string, agentId:
   return updatedChannel(rows);
 }
 
+/**
+ * Sets the sites allowed to embed the agent's widget (validated and normalized again here). Owners and admins can
+ * do it under RLS: only `config` changes, never the widget key.
+ */
+export async function setAllowedOrigins(
+  sql: Sql,
+  organizationId: string,
+  agentId: string,
+  origins: readonly string[],
+): Promise<AgentChannel> {
+  if (!isUuid(organizationId) || !isUuid(agentId)) throw agentNotFound();
+  const normalized = parseAllowedOrigins({ allowedOrigins: origins });
+  if (normalized.length !== origins.length) throw new DomainError('invalid', 'One of the sites is not a valid website address.');
+  const rows = await sql.query<ChannelRow>(
+    `update public.agent_channels set config = jsonb_set(config, '{allowedOrigins}', $3::jsonb, true)
+     where organization_id = $1 and agent_id = $2 and channel = 'web_chat'
+     returning ${CHANNEL_COLUMNS}`,
+    [organizationId, agentId, JSON.stringify(normalized)],
+  );
+  return updatedChannel(rows);
+}
+
 function updatedChannel(rows: readonly ChannelRow[]): AgentChannel {
   const row = maybeOne(rows);
   // No row: no channel yet, another organization's agent, or (under RLS) a member, who can see the channel
@@ -288,7 +321,7 @@ export async function findPublishedWidget(sql: Sql, publicKey: string): Promise<
     await sql.query<PublishedWidgetRow>(
       `select a.id, a.organization_id, a.name, a.status, a.greeting, a.language, a.timezone, a.instructions,
               a.lead_capture, a.created_at, a.updated_at,
-              c.id as channel_id, c.channel, c.enabled, c.public_key,
+              c.id as channel_id, c.channel, c.enabled, c.public_key, c.config,
               c.created_at as channel_created_at, c.updated_at as channel_updated_at
        from public.agent_channels c
        join public.agents a on a.id = c.agent_id and a.organization_id = c.organization_id
@@ -306,6 +339,7 @@ export async function findPublishedWidget(sql: Sql, publicKey: string): Promise<
       channel: row.channel,
       enabled: row.enabled,
       public_key: row.public_key,
+      config: row.config,
       created_at: row.channel_created_at,
       updated_at: row.channel_updated_at,
     }),

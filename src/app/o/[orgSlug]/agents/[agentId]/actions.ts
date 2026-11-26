@@ -23,9 +23,11 @@ import { isUuid } from '@/server/db/sql';
 import {
   ensureWebChatChannel,
   rotateWidgetKey,
+  setAllowedOrigins,
   setWebChatEnabled,
   updateAgentSettings,
 } from '@/server/domain/agents/repository';
+import { allowedOriginsInputSchema } from '@/server/domain/agents/schemas';
 import { replaceBusinessHours, upsertBusinessProfile } from '@/server/domain/business/repository';
 
 /*
@@ -196,4 +198,44 @@ export async function rotateWidgetKeyAction(
   }
   revalidateAdminPages();
   return { status: 'success', message: 'New widget key issued. Update the embed code on your website.' };
+}
+
+/**
+ * Sets the websites allowed to embed the widget (browser-enforced framing control, not authentication). Runs under
+ * USER scope: owners and admins may change the channel's config, never its key.
+ */
+export async function updateAllowedOriginsAction(
+  orgSlug: string,
+  agentId: string,
+  _previous: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const authorization = await authorizeAdminAction(orgSlug);
+  if (!authorization.ok) return authorization.state;
+  const { access } = authorization;
+  if (!isUuid(agentId)) return AGENT_NOT_FOUND_STATE;
+
+  const parsed = allowedOriginsInputSchema.safeParse(formString(formData, 'allowedOrigins'));
+  if (!parsed.success) {
+    return { status: 'error', message: parsed.error.issues[0]?.message ?? 'Check the list of websites.' };
+  }
+
+  const organizationId = access.organization.id;
+  try {
+    await serviceScope(getAppServices().db).run((sql) => ensureWebChatChannel(sql, organizationId, agentId));
+    const channel = await access.db.run((sql) => setAllowedOrigins(sql, organizationId, agentId, parsed.data));
+    await recordAdminAudit(access, {
+      action: 'agent.web_chat_sites_updated',
+      targetType: 'agent',
+      targetId: channel.agentId,
+      metadata: { channelId: channel.id, sites: channel.allowedOrigins.length },
+    });
+  } catch (error) {
+    return adminActionFailed(access, 'agent.web_chat_sites_updated', error);
+  }
+  revalidateAdminPages();
+  return {
+    status: 'success',
+    message: parsed.data.length === 0 ? 'Any website can now show this chat.' : 'Allowed websites saved.',
+  };
 }

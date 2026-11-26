@@ -4,6 +4,7 @@ import { createProviderRegistry } from '@/server/ai/registry';
 import { ModelRouter } from '@/server/ai/router';
 import { ProviderError, type EmbeddingProvider } from '@/server/ai/types';
 import { EMBEDDING_DIMENSIONS, loadAiConfig } from '@/server/config/env';
+import { UsageLimitError, unlimitedUsageGuard, type UsageGuard } from '@/server/domain/usage/limits';
 import type {
   EmbeddingUsagePurpose,
   EmbeddingUsageReport,
@@ -16,10 +17,13 @@ import { ScriptedTextProvider } from '../support/scripted-text-provider';
 class RecordingUsage implements UsageRecorder {
   readonly embeddings: Array<{ context: UsageContext; purpose: EmbeddingUsagePurpose; report: EmbeddingUsageReport }> = [];
 
-  async recordTextGeneration(): Promise<void> {}
+  async recordTextGeneration() {
+    return { estimatedCostUsd: 0, pricingKnown: false };
+  }
 
   async recordEmbedding(context: UsageContext, purpose: EmbeddingUsagePurpose, report: EmbeddingUsageReport) {
     this.embeddings.push({ context, purpose, report });
+    return { estimatedCostUsd: 0, pricingKnown: false };
   }
 }
 
@@ -41,8 +45,22 @@ function setup(provider: EmbeddingProvider, options: { batchSize?: number; model
     embedding: { [provider.id]: () => provider },
   });
   const usage = new RecordingUsage();
-  const service = new EmbeddingService({ router: new ModelRouter(config, registry), usage, batchSize: options.batchSize });
-  return { service, usage };
+  const sleeps: number[] = [];
+  const service = new EmbeddingService({
+    router: new ModelRouter(config, registry),
+    usage,
+    guard: unlimitedUsageGuard,
+    batchSize: options.batchSize,
+    retry: config.retry,
+    retryEnvironment: {
+      random: () => 0.5,
+      sleep: (ms) => {
+        sleeps.push(ms);
+        return Promise.resolve();
+      },
+    },
+  });
+  return { service, usage, sleeps };
 }
 
 const texts = (count: number) => Array.from({ length: count }, (_, i) => `knowledge passage number ${i} about topic ${i % 7}`);
@@ -149,12 +167,44 @@ describe('EmbeddingService', () => {
     });
   });
 
-  it('propagates provider errors unchanged and does not meter the failed batch', async () => {
+  it('propagates non-retryable provider errors unchanged and does not meter the failed batch', async () => {
     const provider = new FakeEmbeddingProvider('fake');
-    const { service, usage } = setup(provider);
-    const error = new ProviderError({ provider: 'fake', code: 'rate_limited', retryable: true, message: 'slow down' });
+    const { service, usage, sleeps } = setup(provider);
+    const error = new ProviderError({ provider: 'fake', code: 'auth', retryable: false, message: 'bad key' });
     provider.failNext = error;
     await expect(service.embed(['opening hours'], { ...CONTEXT, purpose: 'knowledge_query' })).rejects.toBe(error);
+    expect(usage.embeddings).toHaveLength(0);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('retries a retryable failure on the same model and meters only the attempt that succeeded', async () => {
+    const provider = new FakeEmbeddingProvider('fake');
+    const { service, usage, sleeps } = setup(provider);
+    provider.failNext = new ProviderError({ provider: 'fake', code: 'rate_limited', retryable: true, message: 'slow down' });
+    const outcome = await service.embed(['opening hours'], { ...CONTEXT, purpose: 'knowledge_query' });
+    expect(outcome.vectors).toHaveLength(1);
+    expect(sleeps).toEqual([300]);
+    expect(usage.embeddings).toHaveLength(1);
+  });
+
+  it('refuses a batch the organization spend limit does not allow, before calling the provider', async () => {
+    const provider = new FakeEmbeddingProvider('fake');
+    const config = loadAiConfig({ AI_TEXT_PROVIDER: 'text', AI_ESCALATION_ENABLED: 'false', AI_EMBEDDING_PROVIDER: 'fake' });
+    const registry = createProviderRegistry({
+      text: { text: () => new ScriptedTextProvider('text', []) },
+      embedding: { fake: () => provider },
+    });
+    const refused = new UsageLimitError('daily_spend');
+    const guard: UsageGuard = {
+      reserveText: () => Promise.reject(refused),
+      reserveEmbedding: () => Promise.reject(refused),
+      release: () => Promise.resolve(),
+      limits: () => Promise.resolve({ dailySpendUsd: 0, monthlySpendUsd: 0, maxConversationTurns: 1 }),
+    };
+    const usage = new RecordingUsage();
+    const service = new EmbeddingService({ router: new ModelRouter(config, registry), usage, guard });
+    await expect(service.embed(['opening hours'], { ...CONTEXT, purpose: 'knowledge_query' })).rejects.toBe(refused);
+    expect(provider.requests).toHaveLength(0);
     expect(usage.embeddings).toHaveLength(0);
   });
 

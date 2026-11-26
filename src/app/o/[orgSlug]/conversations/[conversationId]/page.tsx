@@ -22,6 +22,8 @@ const TOOL_RUN_BADGES: Record<ToolRunRecord['status'], { label: string; tone: Ba
   failed: { label: 'Failed', tone: 'danger' },
   rejected: { label: 'Rejected', tone: 'warning' },
   running: { label: 'Running', tone: 'info' },
+  // An external action that was sent but not confirmed: it needs reconciliation, never a silent retry.
+  unknown: { label: 'Outcome unknown', tone: 'warning' },
 };
 
 const SYSTEM_EVENTS: ReadonlyMap<string, string> = new Map([

@@ -1125,7 +1125,9 @@ describe('schema guarantees', () => {
            where k.contype = 'f' and k.conrelid = ('public.' || c.table_name)::regclass and a.attname = c.column_name
          )`,
     );
+    // conversations.turn_lock_token is a random fencing token, not a reference.
     expect(sorted(columns.map((row) => row.name))).toEqual([
+      'conversations.turn_lock_token',
       'conversations.visitor_id',
       'usage_records.agent_id',
       'usage_records.conversation_id',
@@ -1331,7 +1333,7 @@ describe("domain services given organization A's id and B's entity ids", () => {
       asService((sql) => appendMessage(sql, A.orgId, B.conversationId, { role: 'assistant', content: 'Injected' })),
       'not_found',
     );
-    expect(await asService((sql) => tryAcquireTurnLock(sql, A.orgId, B.conversationId, 60))).toBe(false);
+    expect(await asService((sql) => tryAcquireTurnLock(sql, A.orgId, B.conversationId, 60))).toBeNull();
     await asService((sql) => updateSummary(sql, A.orgId, B.conversationId, 'Hijacked', 1_000_000));
     await expectDomainError(
       asService((sql) =>
@@ -1387,13 +1389,15 @@ describe("domain services given organization A's id and B's entity ids", () => {
   });
 
   it("does not release B's turn lock from A", async () => {
-    expect(await asService((sql) => tryAcquireTurnLock(sql, B.orgId, B.conversationId, 60))).toBe(true);
+    const token = await asService((sql) => tryAcquireTurnLock(sql, B.orgId, B.conversationId, 60));
+    expect(token).not.toBeNull();
     try {
-      await asService((sql) => releaseTurnLock(sql, A.orgId, B.conversationId));
+      // Even with B's own owner token, A's organization id matches nothing.
+      expect(await asService((sql) => releaseTurnLock(sql, A.orgId, B.conversationId, token!))).toBe(false);
       // Still held: another turn of B cannot start.
-      expect(await asService((sql) => tryAcquireTurnLock(sql, B.orgId, B.conversationId, 60))).toBe(false);
+      expect(await asService((sql) => tryAcquireTurnLock(sql, B.orgId, B.conversationId, 60))).toBeNull();
     } finally {
-      await asService((sql) => releaseTurnLock(sql, B.orgId, B.conversationId));
+      await asService((sql) => releaseTurnLock(sql, B.orgId, B.conversationId, token!));
     }
   });
 
@@ -1447,7 +1451,7 @@ describe('agent runtime and tools', () => {
 
     await expectDomainError(
       services.runChatTurn(
-        { organizationId: A.orgId, agent: agentA, conversationId: B.conversationId, channel: 'web_chat', userText: 'Hello?' },
+        { organizationId: A.orgId, agent: agentA, conversationId: B.conversationId, lockToken: randomUUID(), channel: 'web_chat', userText: 'Hello?' },
         emit,
       ),
       'not_found',
@@ -1455,14 +1459,14 @@ describe('agent runtime and tools', () => {
     // B's agent presented under A's organization (or in A's conversation) is refused before anything is read.
     await expectDomainError(
       services.runChatTurn(
-        { organizationId: A.orgId, agent: agentB, conversationId: A.conversationId, channel: 'web_chat', userText: 'Hello?' },
+        { organizationId: A.orgId, agent: agentB, conversationId: A.conversationId, lockToken: randomUUID(), channel: 'web_chat', userText: 'Hello?' },
         emit,
       ),
       'not_found',
     );
     await expectDomainError(
       services.runChatTurn(
-        { organizationId: B.orgId, agent: agentB, conversationId: A.conversationId, channel: 'web_chat', userText: 'Hello?' },
+        { organizationId: B.orgId, agent: agentB, conversationId: A.conversationId, lockToken: randomUUID(), channel: 'web_chat', userText: 'Hello?' },
         emit,
       ),
       'not_found',

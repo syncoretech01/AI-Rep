@@ -42,14 +42,14 @@ describe('ModelRouter text routing', () => {
     expect(router.selectText({ task: 'chat_response', channel: 'web_chat', complexity: 'routine' }).tier).toBe('default');
   });
 
-  it('escalates a chat response after a failed default attempt', () => {
-    const route = router.selectText({ task: 'chat_response', channel: 'web_chat', priorFailure: true });
+  it('escalates a chat response after a demonstrated quality failure of the default model', () => {
+    const route = router.selectText({ task: 'chat_response', channel: 'web_chat', qualityFailure: 'invalid_tool_calls' as const });
     expect(route).toMatchObject({
       tier: 'escalation',
       providerId: 'strong',
       model: 'strong-model',
       reasoningEffort: 'high',
-      reason: 'escalation:prior_failure',
+      reason: 'escalation:quality:invalid_tool_calls',
     });
     expect(route.provider).toBe(registry.getText('strong'));
   });
@@ -61,7 +61,7 @@ describe('ModelRouter text routing', () => {
     );
     expect(plain.selectText({ task: 'chat_response', channel: 'web_chat' }).reasoningEffort).toBeUndefined();
     expect(
-      plain.selectText({ task: 'chat_response', channel: 'web_chat', priorFailure: true }).reasoningEffort,
+      plain.selectText({ task: 'chat_response', channel: 'web_chat', qualityFailure: 'invalid_tool_calls' as const }).reasoningEffort,
     ).toBeUndefined();
   });
 
@@ -70,13 +70,13 @@ describe('ModelRouter text routing', () => {
     expect(route).toMatchObject({ tier: 'escalation', model: 'strong-model', reason: 'escalation:complex' });
   });
 
-  it('reports a prior failure as the escalation reason when both reasons apply', () => {
-    const route = router.selectText({ task: 'chat_response', channel: 'web_chat', complexity: 'complex', priorFailure: true });
-    expect(route).toMatchObject({ tier: 'escalation', model: 'strong-model', reason: 'escalation:prior_failure' });
+  it('reports the quality failure as the escalation reason when both reasons apply', () => {
+    const route = router.selectText({ task: 'chat_response', channel: 'web_chat', complexity: 'complex', qualityFailure: 'invalid_tool_calls' as const });
+    expect(route).toMatchObject({ tier: 'escalation', model: 'strong-model', reason: 'escalation:quality:invalid_tool_calls' });
   });
 
   it('never escalates summaries', () => {
-    for (const request of [{}, { priorFailure: true }, { complexity: 'complex' as const, priorFailure: true }]) {
+    for (const request of [{}, { qualityFailure: 'invalid_tool_calls' as const }, { complexity: 'complex' as const, qualityFailure: 'invalid_tool_calls' as const }]) {
       const route = router.selectText({ task: 'conversation_summary', channel: 'web_chat', ...request });
       expect(route).toMatchObject({ tier: 'default', providerId: 'cheap', model: 'cheap-model', reason: 'default' });
     }
@@ -87,7 +87,7 @@ describe('ModelRouter text routing', () => {
   it('stays on the default profile when escalation is disabled', () => {
     const disabled = new ModelRouter(loadAiConfig({ ...ENV, AI_ESCALATION_ENABLED: 'false' }), fakeRegistry());
     expect(disabled.canEscalate('chat_response')).toBe(false);
-    for (const request of [{ priorFailure: true }, { complexity: 'complex' as const }]) {
+    for (const request of [{ qualityFailure: 'invalid_tool_calls' as const }, { complexity: 'complex' as const }]) {
       expect(disabled.selectText({ task: 'chat_response', channel: 'web_chat', ...request })).toMatchObject({
         tier: 'default',
         model: 'cheap-model',
@@ -125,7 +125,7 @@ describe('ModelRouter configuration validation', () => {
 
   it('does not require the provider of a disabled escalation profile', () => {
     const router = new ModelRouter(loadAiConfig({ ...ENV, AI_ESCALATION_ENABLED: 'false' }), fakeRegistry(['cheap']));
-    expect(router.selectText({ task: 'chat_response', channel: 'web_chat', priorFailure: true }).providerId).toBe('cheap');
+    expect(router.selectText({ task: 'chat_response', channel: 'web_chat', qualityFailure: 'invalid_tool_calls' as const }).providerId).toBe('cheap');
   });
 
   it('does not instantiate providers while validating', () => {
@@ -166,7 +166,7 @@ describe('provider/model switch through configuration (acceptance scenario 6)', 
     expect(chat.providerId).toBe('alt');
     expect(chat.model).toBe('alt-mini');
     expect(chat.provider.id).toBe('alt');
-    expect(router.selectText({ task: 'chat_response', channel: 'web_chat', priorFailure: true }).model).toBe('alt-max');
+    expect(router.selectText({ task: 'chat_response', channel: 'web_chat', qualityFailure: 'invalid_tool_calls' as const }).model).toBe('alt-max');
     expect(router.selectEmbedding()).toMatchObject({ providerId: 'alt-vectors', model: 'alt-embed' });
   });
 
@@ -178,7 +178,7 @@ describe('provider/model switch through configuration (acceptance scenario 6)', 
       model: config.text.model,
       reasoningEffort: config.text.reasoningEffort,
     });
-    expect(router.selectText({ task: 'chat_response', channel: 'web_chat', priorFailure: true }).model).toBe(
+    expect(router.selectText({ task: 'chat_response', channel: 'web_chat', qualityFailure: 'invalid_tool_calls' as const }).model).toBe(
       config.escalation.model,
     );
     expect(config.escalation.model).not.toBe(config.text.model);

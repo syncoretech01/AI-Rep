@@ -35,6 +35,12 @@ export interface EmbeddingUsageReport {
  * detail to reconcile, and never breaks a customer conversation.
  */
 export interface UsageRecorder {
-  recordTextGeneration(context: UsageContext, purpose: TextUsagePurpose, report: TextUsageReport): Promise<void>;
-  recordEmbedding(context: UsageContext, purpose: EmbeddingUsagePurpose, report: EmbeddingUsageReport): Promise<void>;
+  recordTextGeneration(context: UsageContext, purpose: TextUsagePurpose, report: TextUsageReport): Promise<RecordedUsage>;
+  recordEmbedding(context: UsageContext, purpose: EmbeddingUsagePurpose, report: EmbeddingUsageReport): Promise<RecordedUsage>;
+}
+
+/** The estimate a record was stored with (also returned when storing failed, so callers can still log it). */
+export interface RecordedUsage {
+  estimatedCostUsd: number;
+  pricingKnown: boolean;
 }

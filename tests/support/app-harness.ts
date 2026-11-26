@@ -483,6 +483,8 @@ function buildHarness(t: TestDatabase, ownsDatabase: boolean, options: AppHarnes
     ai,
     widget,
     now: clock.now,
+    // Provider retries wait without delay (the backoff itself is unit-tested).
+    retryEnvironment: { random: () => 0.5, sleep: () => Promise.resolve() },
     providers: {
       text: Object.fromEntries(Object.entries(textModels).map(([id, provider]) => [id, () => provider])),
       embedding: { [FAKE_EMBEDDING_PROVIDER]: () => embeddings },

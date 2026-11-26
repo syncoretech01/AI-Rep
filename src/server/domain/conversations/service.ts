@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { ScopedDb } from '@/server/db/scope';
 import { jsonParam, maybeOne, pgTextArray, toDate, toNumber } from '@/server/db/sql';
 import type { Sql } from '@/server/db/types';
@@ -253,12 +254,32 @@ export async function closeConversation(sql: Sql, organizationId: string, conver
   );
 }
 
+/**
+ * Raised when a write made on behalf of a turn finds that the turn no longer owns the conversation's turn lock
+ * (it expired and another worker acquired it). The stale worker must stop writing.
+ */
+export class TurnLockLostError extends DomainError {
+  constructor() {
+    super('conflict', 'The conversation is being handled by another request.');
+    this.name = 'TurnLockLostError';
+  }
+}
+
+export interface AppendOptions {
+  /**
+   * Fencing token of the caller's turn lock: the message is written only while the conversation's lock token
+   * still matches, so a worker whose lock lapsed and was taken over cannot interleave writes (TurnLockLostError).
+   */
+  lockToken?: string;
+}
+
 /** Inserts a message and bumps conversations.message_count / last_message_at. */
 export async function appendMessage(
   sql: Sql,
   organizationId: string,
   conversationId: string,
   message: NewMessage,
+  options: AppendOptions = {},
 ): Promise<Message> {
   const toolName = message.toolName ?? null;
   const isToolRole = message.role === 'tool_call' || message.role === 'tool_result';
@@ -268,15 +289,18 @@ export async function appendMessage(
   if (!isUuid(organizationId) || !isUuid(conversationId)) {
     throw new DomainError('not_found', 'Conversation not found.');
   }
+  const lockToken = options.lockToken ?? null;
+  if (lockToken !== null && !isUuid(lockToken)) throw new TurnLockLostError();
 
-  // One statement: the message is inserted only if the organization's conversation
-  // exists, and its counters move in step (the row lock serializes concurrent appends).
+  // One statement: the message is inserted only if the organization's conversation exists (and, when fenced,
+  // the caller still owns its turn lock), and its counters move in step (the row lock serializes concurrent
+  // appends and lock acquisitions).
   const row = maybeOne(
     await sql.query<MessageRow>(
       `with conversation as (
          update public.conversations
          set message_count = message_count + 1, last_message_at = now()
-         where id = $1 and organization_id = $2
+         where id = $1 and organization_id = $2 and ($9::uuid is null or turn_lock_token = $9::uuid)
          returning id, organization_id
        )
        insert into public.messages
@@ -293,10 +317,14 @@ export async function appendMessage(
         message.toolCallId ? storableText(message.toolCallId, MAX_TOOL_CALL_ID_CHARS) : null,
         message.toolRunId ?? null,
         storableJson(message.data ?? {}),
+        lockToken,
       ],
     ),
   );
-  if (!row) throw new DomainError('not_found', 'Conversation not found.');
+  if (!row) {
+    if (lockToken !== null && (await getConversation(sql, organizationId, conversationId))) throw new TurnLockLostError();
+    throw new DomainError('not_found', 'Conversation not found.');
+  }
   return mapMessage(row);
 }
 
@@ -339,33 +367,72 @@ export async function listRecentTextMessages(
   return listMessages(sql, organizationId, conversationId, { roles: ['user', 'assistant'], limit });
 }
 
-/** Atomically claims the conversation for one turn. false if another turn holds an unexpired lock. */
+/**
+ * Atomically claims the conversation for one turn. Returns the lock's owner token, or null if another turn holds
+ * an unexpired lock. The token is unique per acquisition: pass it to releaseTurnLock and as the fencing token of
+ * the turn's writes (AppendOptions.lockToken). Lock state lives in Postgres, so this holds across app instances.
+ */
 export async function tryAcquireTurnLock(
   sql: Sql,
   organizationId: string,
   conversationId: string,
   ttlSeconds: number,
-): Promise<boolean> {
+): Promise<string | null> {
   if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) throw new RangeError('ttlSeconds must be a positive number');
-  if (!isUuid(organizationId) || !isUuid(conversationId)) return false;
+  if (!isUuid(organizationId) || !isUuid(conversationId)) return null;
+  const token = randomUUID();
   // Concurrent claims serialize on the row lock; the loser re-checks the committed lock and matches nothing.
   const rows = await sql.query(
     `update public.conversations
-     set turn_locked_until = now() + make_interval(secs => $3::double precision)
+     set turn_locked_until = now() + make_interval(secs => $3::double precision), turn_lock_token = $4::uuid
      where id = $1 and organization_id = $2 and (turn_locked_until is null or turn_locked_until <= now())
      returning id`,
-    [conversationId, organizationId, ttlSeconds],
+    [conversationId, organizationId, ttlSeconds, token],
+  );
+  return rows.length > 0 ? token : null;
+}
+
+/**
+ * Releases the lock only if `token` still owns it: a worker whose lock expired (and was acquired by another
+ * turn) cannot release the new owner's lock. Returns whether this call released it.
+ */
+export async function releaseTurnLock(
+  sql: Sql,
+  organizationId: string,
+  conversationId: string,
+  token: string,
+): Promise<boolean> {
+  if (!isUuid(organizationId) || !isUuid(conversationId) || !isUuid(token)) return false;
+  const rows = await sql.query(
+    `update public.conversations set turn_locked_until = null, turn_lock_token = null
+     where id = $1 and organization_id = $2 and turn_lock_token = $3::uuid
+     returning id`,
+    [conversationId, organizationId, token],
   );
   return rows.length > 0;
 }
 
-export async function releaseTurnLock(sql: Sql, organizationId: string, conversationId: string): Promise<void> {
-  if (!isUuid(organizationId) || !isUuid(conversationId)) return;
-  await sql.query(
-    `update public.conversations set turn_locked_until = null
-     where id = $1 and organization_id = $2 and turn_locked_until is not null`,
-    [conversationId, organizationId],
+/** True while `token` owns the conversation's turn lock (it may have expired without being taken over). */
+export async function holdsTurnLock(sql: Sql, organizationId: string, conversationId: string, token: string): Promise<boolean> {
+  if (!isUuid(organizationId) || !isUuid(conversationId) || !isUuid(token)) return false;
+  const rows = await sql.query(
+    'select 1 from public.conversations where id = $1 and organization_id = $2 and turn_lock_token = $3::uuid',
+    [conversationId, organizationId, token],
   );
+  return rows.length > 0;
+}
+
+/** Visitor messages so far: the conversation-length limit counts turns, not tool rows. */
+export async function countUserMessages(sql: Sql, organizationId: string, conversationId: string): Promise<number> {
+  if (!isUuid(organizationId) || !isUuid(conversationId)) return 0;
+  const row = maybeOne(
+    await sql.query<{ count: string | number }>(
+      `select count(*) as count from public.messages
+       where organization_id = $1 and conversation_id = $2 and role = 'user'`,
+      [organizationId, conversationId],
+    ),
+  );
+  return row ? toNumber(row.count) : 0;
 }
 
 /** Monotonic: only applies when throughSeq > current summary_through_seq. */
