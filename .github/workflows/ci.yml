@@ -1,0 +1,44 @@
+# Minimal CI: clean install, typecheck, lint, tests and production build on every push and pull request.
+# No secrets: the test suite runs against PGlite (Postgres in WebAssembly) with fake model providers, and the build
+# needs no runtime configuration. Live provider/database validation is manual (LIVE_VALIDATION.md).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install (clean, from package-lock.json)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
