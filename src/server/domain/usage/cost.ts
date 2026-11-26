@@ -16,6 +16,8 @@ export interface CostEstimate {
 export interface CostEstimator {
   text(model: string, usage: TokenUsage): CostEstimate;
   embedding(model: string, inputTokens: number): CostEstimate;
+  /** Realtime voice session time (seconds active / in standby) at the model's per-minute rates. */
+  voice(model: string, seconds: { activeSeconds: number; standbySeconds: number }): CostEstimate;
 }
 
 /** Negative or non-finite counts (a misbehaving adapter) price as zero. */
@@ -61,6 +63,15 @@ export function createCostEstimator(overrides: Record<string, ModelPrice> = {}):
       const price = priceOf(model);
       if (!price) return { usd: 0, known: false };
       return { usd: roundUsd((count(inputTokens) * price.inputPerMTok) / 1e6), known: true };
+    },
+    voice(model, { activeSeconds, standbySeconds }) {
+      const price = priceOf(model);
+      if (price?.activePerMinute === undefined) return { usd: 0, known: false };
+      const standbyRate = price.standbyPerMinute ?? price.activePerMinute;
+      return {
+        usd: roundUsd((count(activeSeconds) * price.activePerMinute + count(standbySeconds) * standbyRate) / 60),
+        known: true,
+      };
     },
   };
 }

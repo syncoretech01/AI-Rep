@@ -11,7 +11,7 @@ validation procedure and results: [LIVE_VALIDATION.md](LIVE_VALIDATION.md). Perm
 | 0 | Multi-tenant foundation | Implemented |
 | 1 | Web chatbot, knowledge and tools | Implemented |
 | 1.5 | Hardening and live validation | Implemented in code; live validation pending credentials |
-| 2 | Shared realtime voice engine and minimal browser voice proof of concept | Not started |
+| 2 | Shared realtime voice engine and minimal browser voice proof of concept | Implemented in code; **not complete** — live voice validation, S2.2 measurements and S3.1 pending |
 | 3 | Inbound telephone receptionist, callback capture and human transfer | Not started |
 | 4 | Appointment booking, SMS and customer-conversion workflows | Not started |
 | 5 | Production-quality website live voice widget | Not started |
@@ -274,6 +274,31 @@ are met.
 persistence, metering and limits — that Phase 3 (phone) and Phase 5 (website widget) reuse, proven end-to-end by a
 minimal, developer-only browser page. Not a tenant-facing feature.
 
+### Implementation status (2026-11-26)
+
+Code, automated tests and documentation are in the repository; **no live GPT-Live session has been run** (no
+credentials in the build environment), so Phase 2 is not complete. Status per item:
+
+| Item | Status |
+| --- | --- |
+| S2.1 sideband proof | Implemented (adapter, gateway, voice lab); live evidence **blocked** (LIVE_VALIDATION.md §9, V1–V2) |
+| S2.2 delegation decision | Both modes implemented behind `AI_VOICE_DELEGATION`; Responses delegation selected **provisionally** on documentation and complexity; measurements **blocked** (VOICE_QUALITY.md §13.4) |
+| S3.1 carrier path | Documentation re-verified: GPT-Live supports SIP inbound/outbound with carrier trunks such as Twilio; live proof is Phase 3 work |
+| Build 1 voice gateway | Done: `npm run voice:gateway`, `/health`, graceful shutdown, stale-session recovery |
+| Build 2 server-side session creation | Done for the developer lab (signed-in owner/admin instead of a visitor voice token; the token arrives with the Phase 5 widget) |
+| Build 3 sideband attach, dedupe, close reasons | Done; a sideband lost beyond the replay window settles the session (no re-attach) |
+| Build 4 tools through the executor | Done (`web_voice` channel, all four tools; captureLead requires read-back confirmation on voice) |
+| Build 5 transcript persistence | Done (provider offsets, `interrupted` flag) |
+| Build 6 metering | Done: active/standby seconds, backend tokens, per-second voice prices; the reservation is in USD (`ai_spend_usd`) for the whole maximum length rather than a separate `voice_seconds` resource. Input transcription is not separately reported by GPT-Live events and is not metered |
+| Build 7 limits | Done: org + env concurrent sessions, maximum length, silence, idle → standby, per-minute start rate. A platform-wide session cap is not implemented |
+| Build 8 dev-only page | Done: `/o/<org>/voice-lab`, `VOICE_DEV_ENABLED` (404 otherwise) |
+| Build 9 latency instrumentation | Partly: `voice.turn.completed` with provider timing and response gaps, `voice.tool.completed`; no browser playout beacon, no interruption-to-audio-stop (no provider event) |
+| Acceptance 1, 5, 10 (live), 11, 12 | **Blocked** (no live runs) |
+| Acceptance 2 one engine | Met: same registry/executor; architecture test covers the gateway composition root |
+| Acceptance 3 no provider secret in browser | Met for the lab: response carries only SDP + our ids; lab routes need a signed-in admin (visitor token is Phase 5) |
+| Acceptance 4 pinned configuration | Automated part met; live disallowed-event check (V10) blocked |
+| Acceptance 6, 7, 8, 9, 13 | Automated parts met (fake provider); live parts blocked |
+
 ### Spikes (before build)
 
 - **S2.1 Sideband delegation proof.** Server creates a GPT-Live session (`gpt-live-1.1`) with
@@ -404,9 +429,10 @@ requires its result, or the fallback decision, to close Phase 2. No Phase 3 buil
 webhook → `POST /v1/live/sessions/{id}/accept` with the tenant's configuration → sideband attach → conversation on
 `gpt-live-1.1`, with DTMF and a `/refer` transfer to a PSTN number.
 
-Status: this path is an **inference**. OpenAI's SIP guide supports GPT-Live; the only official Twilio trunk guide
-targets the Realtime API (`gpt-realtime`); Twilio's own GPT-Live material uses Media Streams. Documented fallbacks, chosen
-by measurement if the primary path fails or misses the [VOICE_QUALITY.md](VOICE_QUALITY.md) phone targets:
+Status (re-verified 2026-11-26): OpenAI's GPT-Live SIP guide documents inbound calls (`live.transport.incoming`,
+accept/reject/refer/hang up) and outbound calls (`POST /v1/live/sessions` with a SIP transport) through carrier trunks
+such as Twilio, so this path is **documented but not yet proven live**. The fallbacks below remain only in case the
+live proof fails or misses the [VOICE_QUALITY.md](VOICE_QUALITY.md) phone targets:
 
 | Fallback | Description | Cost/complexity |
 | --- | --- | --- |

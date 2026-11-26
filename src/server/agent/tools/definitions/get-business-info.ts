@@ -16,7 +16,7 @@ export const getBusinessInfo = defineTool({
     'Use it whenever the visitor asks how to reach the business, where it is or which area it serves. ' +
     'Share only the details it returns.',
   input: z.object({}),
-  channels: ['web_chat'],
+  channels: ['web_chat', 'web_voice'],
   requires: ['business_info'],
   sideEffects: 'none',
   idempotency: 'none',

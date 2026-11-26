@@ -317,9 +317,9 @@ The negotiated codec (PCMU/PCMA [S5]) and the call route are recorded per call. 
 
 ### 8.2 Real-provider evaluations
 
-- **Systems under test.** Live runs of the corpus against `gpt-live-1.1` and the fallback `gpt-realtime-2.1` (Realtime API) [S1], with the same tenants, conditions and scoring.
-  - Do not use `gpt-realtime`/`gpt-realtime-mini` as the fallback: they shut down on 2027-01-20 [S1][S2], even though Twilio's official SIP guide targets `gpt-realtime` [S4].
-  - The Phase 2 spike also compares Responses delegation with client delegation, and measures the Twilio SIP -> GPT-Live path against the fallbacks (Realtime API via SIP; Media Streams through the gateway, whose extra hop is measured separately).
+- **Systems under test.** Live runs of the corpus against `gpt-live-1.1` [S1], with the same tenants, conditions and scoring.
+  - GPT-Live supports SIP natively (inbound and outbound, carrier trunks such as Twilio) [S4]: the Realtime API is no longer needed as a telephony fallback (updated 2026-11-26).
+  - The Phase 2 spike also compares Responses delegation with client delegation (§13.4); Phase 3 measures the Twilio SIP -> GPT-Live path.
 - **Run setup.**
   - Use a dedicated OpenAI project and API key, so the Costs API's daily buckets (grouped by project/API key [S2]) isolate evaluation spend.
   - Record model ids exactly as the provider returns them.
@@ -418,14 +418,14 @@ Further conditions by phase:
 
 - **Phase 2** also requires:
   - an evaluation record covering every metric for browser voice;
-  - the Twilio SIP -> GPT-Live feasibility result, or the fallback decision;
+  - the Twilio SIP -> GPT-Live feasibility result (documented by OpenAI as of 2026-11-26; the live proof is S3.1);
   - the delegation-mode decision, with its measurements.
 - **Phase 3:** telephone latency, interruption and naturalness results are disclosed to pilot tenants. They become gates in Phase 6 and before inbound telephone reaches general availability (Phase 7).
 - **Phase 6** additionally requires the consent and compliance checks defined in its phase plan.
 
 ## 11. Open items to verify (spikes, not assumptions)
 
-- Twilio Elastic SIP -> OpenAI SIP -> GPT-Live end to end: TLS/SRTP, Diversion and `X-` headers reaching `sip_headers`, REFER transfer [S4][S5].
+- Twilio Elastic SIP -> OpenAI SIP -> GPT-Live end to end (documented; not yet proven live): TLS/SRTP, Diversion and `X-` headers reaching `sip_headers`, REFER transfer [S4][S5].
 - GPT-Live behaviours that are not documented: turn-detection/eagerness controls, noise reduction, transcription model choice, maximum WebRTC session length [S3].
 - Whether a dropped GPT-Live session can be resumed, or must always be replaced by a new rehydrated session.
 - The input transcription unit price and the Twilio transfer-leg billing.
@@ -437,3 +437,71 @@ Further conditions by phase:
 - [S3] OpenAI GPT-Live guides — https://developers.openai.com/api/docs/guides/live, https://developers.openai.com/api/docs/guides/realtime-webrtc, https://developers.openai.com/api/docs/guides/voice-server-controls, https://developers.openai.com/api/docs/guides/live-delegation, https://developers.openai.com/api/docs/guides/live-conversations
 - [S4] OpenAI SIP — https://developers.openai.com/api/docs/guides/voice-sip
 - [S5] Twilio Elastic SIP Trunking — https://www.twilio.com/docs/sip-trunking, and Twilio US pricing pages (stated "current as of Oct/Nov 2026")
+
+## 13. Phase 2 evaluation status (2026-11-26)
+
+**No real-provider voice evaluation has been run.** The build environment had no OpenAI or Supabase credentials
+(LIVE_VALIDATION.md §9). Nothing below is a measurement of voice quality, latency, accuracy or cost; there is no
+evaluation record under `evaluations/voice/` yet.
+
+### 13.1 Measured vs target
+
+| Metric (§6) | Target | Measured | N | Conditions |
+|---|---|---|---|---|
+| Median speech-to-response latency | < 800 ms | **Not measured** (blocked: no credentials) | 0 | — |
+| P95 ordinary response latency | < 1.5 s | **Not measured** | 0 | — |
+| Interruption-to-audio-stop latency | < 300 ms | **Not measured** | 0 | — |
+| Tested business task completion | ≥ 98% | **Not measured** | 0 | — |
+| Confirmed contact-information accuracy | ≥ 99% | **Not measured** | 0 | — |
+| Fabricated successful actions | 0 | **Not measured live**; logic covered by automated tests (below) | 0 live | — |
+| Duplicate external actions | 0 | **Not measured live**; no external-effect tool exists yet (stub tool deferred) | 0 live | — |
+| Cross-tenant exposure | 0 | **Not measured live**; RLS/composite-key matrix passes on PGlite | 0 live | — |
+| Human-rated naturalness | ≥ 4.5/5 | **Not measured** | 0 | — |
+| Cost per connected minute / per completed call | — (report) | **Not measured**; list-price estimate only: $0.05/min active, $0.02/min standby, plus backend tokens | 0 | — |
+
+### 13.2 Instrumentation implemented (server-observed)
+
+| Need (§6.11) | Implemented as | Gap |
+|---|---|---|
+| Session lifecycle, close reason, active/standby seconds | `voice.session.started` / `voice.session.ended` (status, reason, duration, provider or estimated seconds, cost, tool calls, interruptions, delegated turns, response-gap median/max); `voice_sessions` row | — |
+| Speech start/end, response gap | `voice.turn.completed` per utterance with the provider's `startMs`/`endMs`; on agent turns `responseGapMs` = agent start − caller end (provider clock); the same fields on each transcript message | Excludes the network/playout leg to the listener: a server-observed proxy, not §6.1 listener latency |
+| Interruptions | Barge-in inferred from transcript timing (caller speech starting before the agent's last words ended); message `interrupted: true`; per-session count | GPT-Live reports no interruption or audio-stop event: interruption-to-audio-stop needs the §8.1 harness |
+| Tool timing | `voice.tool.completed` and `tool_runs.duration_ms` (channel `web_voice`) | — |
+| Sideband gaps | `voice.sideband.disconnected`; sessions are settled, not re-attached | Re-attach within the 3 s replay window is not implemented |
+| Browser playout | — | `voice.client.playout_started` beacon not implemented (Phase 5) |
+
+### 13.3 Automated coverage (logic only; fake provider, not quality evidence)
+
+| Scenario (Phase 2 brief) | Automated test | Real-audio evaluation |
+|---|---|---|
+| Normal conversation, transcript persistence, cleanup | `voice-sessions` lifecycle | Blocked |
+| Interruptions | barge-in timing test (committed tool run kept) | Blocked |
+| Pauses, silence | silence (120 s) close; standby is provider-side | Blocked |
+| Background noise, accents | — (provider ASR/VAD; cannot be simulated meaningfully with a fake) | Blocked |
+| Multiple questions, corrections | — (model behaviour) | Blocked |
+| Knowledge retrieval | same executor path as chat (`searchKnowledge` chat tests); voice routes any tool through it | Blocked |
+| Lead capture with read-back | captureLead refused on voice until `detailsConfirmed` | Blocked |
+| Duplicate tool events | same `call_id` twice → one run, one output | Blocked |
+| Provider errors | creation failure (nothing left behind), fatal error, close never confirmed | Blocked |
+| Disconnects | sideband drop → failed with estimated usage, reservation and lock released | Blocked |
+| Tenant isolation | cross-org end refused; `voice_sessions` RLS and composite keys | Blocked |
+| Usage-limit enforcement | concurrency, start rate, spend reservation, session length | Blocked |
+| Gateway crash recovery | stale session claimed once, closed, settled | Blocked |
+
+### 13.4 Delegation comparison (S2.2) — evidence status
+
+| Criterion | Responses delegation | Client delegation | Evidence |
+|---|---|---|---|
+| Response latency | Expected lower: OpenAI pre-warms the backend connection; no hop through our gateway | Expected higher: delegation event → our runtime (Postgres, ModelRouter, model call) → commentary append | Docs + architecture only; **not measured** |
+| Tool latency | Sideband round trip to our executor | Executor in-process, but inside our model loop | Not measured |
+| Naturalness | Voice model speaks backend output directly | Voice model paraphrases our text; delegation may fire before the transcript is final (we wait ≤ 2 s for it to settle) | Not measured |
+| Interruption handling | Native; backend work continues (committed actions kept) | Native; our turn keeps running | Logic tested only |
+| ModelRouter compatibility | Backend model chosen from our config (cheap model); no per-turn escalation | Full ModelRouter, escalation and context assembly | Code |
+| Tenant authorization, idempotency, audit | Same executor (tenant from the session, fencing token, operation records) | Same executor | Automated tests |
+| Context | Provider-held conversation; business rules pinned at start | Our ContextAssembler + rolling summary | Code |
+| Usage accounting | Backend tokens from `response.completed` → `voice_delegation` records | Our runtime meters each call | Automated tests |
+| Cost per resolved task | Voice seconds + backend tokens | Voice seconds + our model tokens (likely similar) | Not measured |
+| Complexity | Lower (documented tool loop) | Higher (settling, commentary chunking, no done signal) | Code |
+
+Selected (provisional): **Responses delegation**, on documentation and complexity grounds. The decision must be
+confirmed or reversed by the V13 live comparison (LIVE_VALIDATION.md §9.4) before Phase 2 can close.

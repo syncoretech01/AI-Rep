@@ -18,6 +18,11 @@ const nextConfig: NextConfig = {
   headers() {
     return Promise.resolve([
       { source: '/:path*', headers: baseSecurityHeaders },
+      // The developer voice lab needs the microphone (same origin only); everything else keeps it disabled.
+      {
+        source: '/o/:orgSlug/voice-lab',
+        headers: [{ key: 'Permissions-Policy', value: 'camera=(), microphone=(self), geolocation=()' }],
+      },
       // The admin app must never be framed (clickjacking).
       {
         source: '/((?!widget/).*)',

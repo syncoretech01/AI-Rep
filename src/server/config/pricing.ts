@@ -18,4 +18,7 @@ export const DEFAULT_MODEL_PRICING: Readonly<Record<string, ModelPrice>> = Objec
   'gpt-6.1-sol': { inputPerMTok: 2.0, cachedInputPerMTok: 0.1, cacheWritePerMTok: 2.5, outputPerMTok: 10.0 },
   'gpt-6-sol': { inputPerMTok: 2.0, cachedInputPerMTok: 0.2, cacheWritePerMTok: 2.5, outputPerMTok: 10.0 },
   'text-embedding-3-small': { inputPerMTok: 0.02, outputPerMTok: 0 },
+  // GPT-Live: billed per second of session time; delegated backend tokens and transcription are billed separately.
+  'gpt-live-1.1': { inputPerMTok: 0, outputPerMTok: 0, activePerMinute: 0.05, standbyPerMinute: 0.02 },
+  'gpt-live-1': { inputPerMTok: 0, outputPerMTok: 0, activePerMinute: 0.05, standbyPerMinute: 0.02 },
 });

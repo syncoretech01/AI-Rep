@@ -25,6 +25,10 @@ class RecordingUsage implements UsageRecorder {
     this.embeddings.push({ context, purpose, report });
     return { estimatedCostUsd: 0, pricingKnown: false };
   }
+
+  async recordVoiceSession() {
+    return { estimatedCostUsd: 0, pricingKnown: false };
+  }
 }
 
 const CONTEXT = {
@@ -198,8 +202,16 @@ describe('EmbeddingService', () => {
     const guard: UsageGuard = {
       reserveText: () => Promise.reject(refused),
       reserveEmbedding: () => Promise.reject(refused),
+      reserveVoice: () => Promise.reject(refused),
       release: () => Promise.resolve(),
-      limits: () => Promise.resolve({ dailySpendUsd: 0, monthlySpendUsd: 0, maxConversationTurns: 1 }),
+      limits: () =>
+        Promise.resolve({
+          dailySpendUsd: 0,
+          monthlySpendUsd: 0,
+          maxConversationTurns: 1,
+          maxConcurrentVoiceSessions: 0,
+          maxVoiceSessionSeconds: 1,
+        }),
     };
     const usage = new RecordingUsage();
     const service = new EmbeddingService({ router: new ModelRouter(config, registry), usage, guard });

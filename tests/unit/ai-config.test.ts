@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_RETRY_POLICY } from '@/server/ai/retry';
-import { loadAiConfig } from '@/server/config/env';
+import { loadAiConfig, loadVoiceConfig } from '@/server/config/env';
 import { PRICING_SNAPSHOT_DATE } from '@/server/config/pricing';
 
 /** Phase 1.5 AI runtime settings: model defaults, retry policy and cost controls, all from configuration. */
@@ -56,6 +56,46 @@ describe('loadAiConfig', () => {
       { AI_MAX_CONVERSATION_TURNS: 'many' },
     ]) {
       expect(() => loadAiConfig(env), JSON.stringify(env)).toThrow(/Invalid AI configuration/);
+    }
+  });
+});
+
+describe('loadVoiceConfig', () => {
+  it('defaults to GPT-Live with Responses delegation, bounded sessions and the developer page off', () => {
+    expect(loadVoiceConfig({})).toEqual({
+      provider: 'openai',
+      model: 'gpt-live-1.1',
+      voice: 'marin',
+      delegation: 'responses',
+      delegationModel: undefined,
+      maxSessionSeconds: 600,
+      maxConcurrentSessions: 2,
+      sessionStartsPerMinute: 6,
+      idleTimeoutSeconds: 20,
+      delegatedTextReservePerMinuteUsd: 0.01,
+      gateway: { url: 'http://127.0.0.1:4100', port: 4100, secret: undefined },
+      devPageEnabled: false,
+    });
+  });
+
+  it('reads overrides and refuses unsafe values', () => {
+    const voice = loadVoiceConfig({
+      AI_VOICE_MODEL: 'gpt-live-1',
+      AI_VOICE_DELEGATION: 'client',
+      AI_VOICE_DELEGATION_MODEL: 'backend-model',
+      VOICE_MAX_SESSION_SECONDS: '120',
+      VOICE_GATEWAY_SECRET: 's'.repeat(32),
+      VOICE_DEV_ENABLED: 'true',
+    });
+    expect(voice).toMatchObject({ model: 'gpt-live-1', delegation: 'client', delegationModel: 'backend-model', maxSessionSeconds: 120, devPageEnabled: true });
+    for (const env of [
+      { AI_VOICE_DELEGATION: 'browser' },
+      { VOICE_MAX_SESSION_SECONDS: '0' },
+      { VOICE_IDLE_TIMEOUT_SECONDS: '120' },
+      { VOICE_GATEWAY_SECRET: 'short' },
+      { VOICE_SESSION_STARTS_PER_MINUTE: '0' },
+    ]) {
+      expect(() => loadVoiceConfig(env), JSON.stringify(env)).toThrow(/Invalid voice configuration/);
     }
   });
 });

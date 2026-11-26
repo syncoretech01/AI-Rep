@@ -18,8 +18,9 @@ Tooling:
 
 ## 1. Status
 
-**As of 2026-11-26: NOT RUN.** No Supabase or OpenAI credentials were available in the build environment. **Nothing
-in this document is a live result.** The "Recorded runs" section (§7) is empty.
+**As of 2026-11-26: NOT RUN.** No Supabase or OpenAI credentials were available in the build environment (checked
+again at the start of Phase 2: no `.env.local`, no `OPENAI_API_KEY` or `DATABASE_URL` in the environment). **Nothing
+in this document is a live result.** The "Recorded runs" sections (§7, §9.5) are empty. Phase 2 voice validation: §9.
 
 Offline verification performed in the build environment (no network services, no credentials):
 
@@ -725,10 +726,98 @@ organizations removed or project deleted: yes / no
 
 | Gap | Why | Where it is addressed |
 | --- | --- | --- |
-| Realtime voice and telephony (GPT-Live, WebRTC, Twilio SIP, the voice gateway) | Not implemented; Twilio SIP → GPT-Live is an inference still to be proven by a spike | Phase 2 (voice engine + browser proof of concept) and Phase 3 (inbound phone) in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) |
+| Telephony (Twilio SIP → GPT-Live) | Not implemented; documented by OpenAI (GPT-Live SIP, carrier trunks such as Twilio) but unproven end to end | Phase 3 (S3.1) |
+| Realtime browser voice (GPT-Live, WebRTC, the voice gateway) | Implemented in Phase 2; live runbook in §9, not yet run | §9 |
 | Provider-confirmed billing reconciliation | Usage costs are estimates from a dated price list (`pricing_version`). OpenAI's Costs API reports daily buckets per project / API key / line item with an admin key, not per request; importing it is not built | Phase 7 |
 | Deterministic live 429/5xx retries | The live provider cannot be made to fail on demand; covered by automated tests with injected failures, and observed live only if `ai.call.retry` events occur | — (see §4 item 10) |
 | External-side-effect operations (`unknown` outcomes, reconciliation) | No tool with external side effects exists yet; `validate:live` only exercises the atomic claim | Phase 4 (SMS, booking) |
 | Real embeddings on Supabase in a scripted check | `validate:live` uses stand-in embeddings; `eval:live` uses PGlite. Only the manual check combines real embeddings with Supabase pgvector | Manual check 3.6.5 / 3.6.8 |
 | Latency and load | This runbook records observations (`firstTokenMs`, `latencyMs` in logs) but is not a benchmark; no latency figures are claimed | Phase 7 (monitoring and scaling) |
 | Public endpoint rate limits under real traffic | Covered by automated tests; not load-tested here | Phase 7 |
+
+---
+
+## 9. Phase 2 — realtime voice validation (GPT-Live)
+
+### 9.1 Status
+
+**As of 2026-11-26 (Phase 2 build): NOT RUN.** The build environment had no `.env.local`, no `OPENAI_API_KEY`, no
+`DATABASE_URL` and no Supabase credentials, so neither the Phase 1.5 checks (§3) nor any voice session could be run
+against real services. **No GPT-Live session has been created from this code. Every voice result in the repository is
+from automated tests with a fake voice provider and is not evidence of provider behaviour, latency, cost or voice
+quality.**
+
+Offline checks performed for Phase 2 (no network services, no credentials):
+
+| Check | What it covers | What it does NOT cover |
+| --- | --- | --- |
+| `tests/integration/voice-sessions.test.ts` | Voice session manager against PGlite, the real tool executor, agent runtime, usage guard and recorder, with a **fake** voice provider: lifecycle, pinned config, tool routing and de-duplication, lead read-back confirmation, barge-in inference, turn timing, client delegation, concurrency/spend/length/start-rate limits, silence, provider failure, sideband drop, close grace, cross-org end, stale-session recovery, shutdown | GPT-Live's real event stream, timing, WebRTC, audio |
+| `tests/unit/openai-live-provider.test.ts` | Our GPT-Live adapter against the documented wire shapes (stubbed HTTP and socket) | Whether the live API still matches the documentation |
+| `tests/unit/voice-gateway-http.test.ts`, `tests/unit/voice-lab.test.ts` | Gateway authentication, validation, error mapping; voice lab disabled = 404, same-origin, org access | A deployed gateway |
+| `tests/integration/tenant-isolation.test.ts` | `voice_sessions` RLS (members read, nobody writes), composite foreign keys | Supabase |
+| Offline gateway smoke test | `npm run voice:gateway` with fake secrets and an unreachable database: starts, `/health` 200, 401 without/with a wrong secret, 400 on invalid input, 500 (generic body, logged) when the database is down, recovery sweep logs the failure | OpenAI, Supabase |
+
+Phase 2 cannot be accepted until the runs below are recorded with real results.
+
+### 9.2 Prerequisites
+
+Everything in §2 and §3.1–3.3 (migrations include `20261127000100_phase_2_voice.sql`), plus: an OpenAI project with
+GPT-Live access; `VOICE_GATEWAY_SECRET` (≥ 32 random characters) and `VOICE_DEV_ENABLED=true` in `.env.local` of the
+machine running the lab (never in a deployed environment); a desktop Chrome or Edge with a headset (avoid speakers:
+echo makes interruption results meaningless).
+
+### 9.3 Procedure
+
+1. `npm run voice:gateway` (expect `voice.gateway.listening` with the model and delegation mode) and `npm run dev`.
+2. Sign in as an owner/admin of a configured test organization (knowledge, hours, profile from §3.6.3–3.6.5); open
+   `/o/<slug>/voice-lab`; start a session; allow the microphone.
+3. Run the scripted scenarios of §9.4, once with `AI_VOICE_DELEGATION=responses` and once with `client` (restart the
+   gateway between modes). Record each session id from the gateway log (`voice.session.started`).
+4. After each session, collect evidence with SQL (service role):
+
+```sql
+-- Session settlement: status, reason, provider-reported seconds, cost
+select id, status, end_reason, delegation, active_seconds, standby_seconds, usage_source, estimated_cost_usd,
+       connected_at - created_at as connect_time, ended_at - connected_at as duration
+from public.voice_sessions order by created_at desc limit 5;
+
+-- Transcript with provider timing and response gaps (ms from session start)
+select m.role, m.content, m.data->>'startMs' as start_ms, m.data->>'endMs' as end_ms,
+       m.data->>'responseGapMs' as response_gap_ms, m.data->>'interrupted' as interrupted
+from public.messages m join public.voice_sessions v on v.conversation_id = m.conversation_id
+where v.id = '<voice session id>' order by m.created_at;
+
+-- Tool runs (channel must be web_voice) and metering
+select tool_name, status, duration_ms, channel from public.tool_runs where conversation_id = '<conversation id>';
+select kind, purpose, model, active_seconds, standby_seconds, input_tokens, output_tokens, estimated_cost_usd
+from public.usage_records where conversation_id = '<conversation id>' order by created_at;
+
+-- Nothing left behind
+select count(*) from app_private.usage_reservations where organization_id = '<organization id>' and expires_at > now();
+select turn_lock_token from public.conversations where id = '<conversation id>';
+```
+
+5. With `usage_source = provider` the stored seconds are the ones GPT-Live reported in `session.closed`; compare the
+   day's estimated voice spend with the OpenAI usage dashboard of the project (daily buckets).
+
+### 9.4 Live checklist (S2.1 and S2.2)
+
+| # | Check | Expected | Result |
+| --- | --- | --- | --- |
+| V1 | Session creation (S2.1) | Browser connects; agent greets or answers; `voice_sessions.status = active` with a `live_…` provider id | NOT RUN |
+| V2 | Sideband tool call (S2.1) | "When are you open?" → `getBusinessHours` `tool_runs` row (`web_voice`, `succeeded`), spoken answer matches the hours | NOT RUN |
+| V3 | Knowledge answer | A question answered in the knowledge base → `searchKnowledge` run, grounded spoken answer | NOT RUN |
+| V4 | Unknown question | No invented facts; offers to take details | NOT RUN |
+| V5 | Lead capture with read-back | Agent reads the phone number back digit by digit and waits; exactly one lead (`web_voice`) after "yes"; none before | NOT RUN |
+| V6 | Interruption | Speak over the agent: audio stops promptly; transcript row `interrupted: true`; no tool run repeated or cancelled | NOT RUN |
+| V7 | Pause and silence | Stay silent 25 s: `session.paused` (standby) then resumes on speech; 120 s of silence ends the session (`end_reason = silence`) | NOT RUN |
+| V8 | Mute / unmute | Muted speech is not transcribed; unmute resumes | NOT RUN |
+| V9 | End and cleanup | End: `status = ended`, `usage_source = provider`, seconds equal `session.closed`, reservation and turn lock released | NOT RUN |
+| V10 | Disallowed browser event | From the browser console, send `{"type":"session.instructions.append",…}` on the data channel: no effect on the conversation | NOT RUN |
+| V11 | Network loss | Disable the network mid-session: session ends (`connection_lost` or sideband drop), settled once, nothing left reserved | NOT RUN |
+| V12 | Limits | Third concurrent session refused (409) before any provider call; spend limit 0 refuses the start | NOT RUN |
+| V13 | Delegation comparison (S2.2) | Same scenarios in both modes: response gaps (median, max), tool durations, task completion, cost per session (voice + backend tokens), subjective naturalness notes | NOT RUN |
+
+### 9.5 Recorded voice runs
+
+**None yet.**

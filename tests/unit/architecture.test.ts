@@ -178,15 +178,17 @@ const openAiSdkOutsideAdapter = (modules: Modules) =>
   importViolations(modules, (unit, ref) => ref.pkg === 'openai' && !inDir(unit.file, 'src/server/ai/openai'));
 
 const PROVIDER_FACTORY = 'src/server/ai/providers.ts';
-const COMPOSITION_ROOTS = ['src/server/services.ts', 'src/server/app-services.ts'];
+const COMPOSITION_ROOTS = ['src/server/services.ts', 'src/server/app-services.ts', 'src/server/voice-gateway.ts'];
+/** Process entry points that build the services from the environment (the app, the voice gateway). */
+const PROVIDER_FACTORY_USERS = ['src/server/app-services.ts', 'src/server/voice-gateway.ts'];
 
-/** The adapters are wired only by the provider factory, and the factory only by the app's composition root. */
+/** The adapters are wired only by the provider factory, and the factory only by the process composition roots. */
 const adapterWiring = (modules: Modules) =>
   importViolations(
     modules,
     (unit, ref) =>
       (targetIn(ref, 'src/server/ai/openai') && !inDir(unit.file, 'src/server/ai/openai') && unit.file !== PROVIDER_FACTORY) ||
-      (ref.target === PROVIDER_FACTORY && unit.file !== 'src/server/app-services.ts'),
+      (ref.target === PROVIDER_FACTORY && !PROVIDER_FACTORY_USERS.includes(unit.file)),
   );
 
 const MODEL_NAME = /gpt-|text-embedding-/i;

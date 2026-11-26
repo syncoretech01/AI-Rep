@@ -287,6 +287,14 @@ async function setUpTenant(spec: TenantSpec): Promise<Tenant> {
   );
 
   const conversationId = grounded.conversationId;
+  // A finished voice test session (Phase 2), as the voice gateway records it.
+  await t.db.query(
+    `insert into public.voice_sessions
+       (organization_id, agent_id, conversation_id, started_by, provider, model, voice, delegation, max_duration_seconds,
+        status, end_reason, active_seconds, usage_source, ended_at)
+     values ($1, $2, $3, $4, 'fake', 'fake-voice', 'marin', 'responses', 600, 'ended', 'close_requested', 42, 'provider', now())`,
+    [organization.id, agent.id, conversationId, owner.id],
+  );
   const single = async (text: string, params: SqlParam[]): Promise<string> => {
     const rows = await t.db.query<{ id: string }>(text, params);
     if (rows.length !== 1 || !rows[0]) throw new Error(`setup: expected one row for: ${text}`);
@@ -706,6 +714,18 @@ const TABLE_RULES: readonly TableRule[] = [
     ],
   },
   {
+    table: 'voice_sessions',
+    readers: 'members',
+    grant: SERVER_WRITTEN,
+    set: "end_reason = 'hijacked'",
+    // A forged session (it would let a tenant inflate or hide voice usage).
+    insert: (x) => [
+      `insert into public.voice_sessions (organization_id, agent_id, conversation_id, provider, model, delegation, max_duration_seconds)
+       values ($1, $2, $3, 'injected', 'injected', 'responses', 60)`,
+      [x.orgId, x.agentId, x.conversationId],
+    ],
+  },
+  {
     table: 'audit_logs',
     // The audit trail is for owners and admins only.
     readers: 'admins',
@@ -955,6 +975,10 @@ const LEAD_INSERT = `insert into public.leads (organization_id, agent_id, contac
 const TOOL_RUN_INSERT = `insert into public.tool_runs (organization_id, agent_id, conversation_id, channel, tool_name, status)
   values ($1, $2, $3, 'web_chat', 'searchKnowledge', 'succeeded') returning id`;
 
+const VOICE_SESSION_INSERT = `insert into public.voice_sessions
+  (organization_id, agent_id, conversation_id, provider, model, delegation, max_duration_seconds)
+  values ($1, $2, $3, 'fake', 'fake-voice', 'responses', 60) returning id`;
+
 const LINK_RULES: readonly LinkRule[] = [
   {
     constraint: 'agent_channels_agent_id_organization_id_fkey',
@@ -1035,6 +1059,14 @@ const LINK_RULES: readonly LinkRule[] = [
       "insert into public.messages (organization_id, conversation_id, role, tool_name, tool_run_id) values ($1, $2, 'tool_result', 'captureLead', $3) returning id",
       [org.orgId, org.conversationId, target.toolRunId],
     ],
+  },
+  {
+    constraint: 'voice_sessions_agent_id_organization_id_fkey',
+    row: (org, target) => [VOICE_SESSION_INSERT, [org.orgId, target.agentId, org.conversationId]],
+  },
+  {
+    constraint: 'voice_sessions_conversation_id_organization_id_fkey',
+    row: (org, target) => [VOICE_SESSION_INSERT, [org.orgId, org.agentId, target.conversationId]],
   },
   { constraint: 'tool_runs_agent_id_organization_id_fkey', row: (org, target) => [TOOL_RUN_INSERT, [org.orgId, target.agentId, org.conversationId]] },
   {

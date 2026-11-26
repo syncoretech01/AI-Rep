@@ -11,7 +11,7 @@ export const getBusinessHours = defineTool({
     "Get the business's weekly opening hours, whether it is open right now (in the business's time zone) and when " +
     'that next changes. Use it for any question about opening hours or availability today.',
   input: z.object({}),
-  channels: ['web_chat'],
+  channels: ['web_chat', 'web_voice'],
   requires: ['business_info'],
   sideEffects: 'none',
   idempotency: 'none',

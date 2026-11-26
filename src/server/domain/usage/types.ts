@@ -7,7 +7,8 @@ export interface UsageContext {
   conversationId?: string | null;
 }
 
-export type TextUsagePurpose = 'chat_response' | 'conversation_summary';
+/** voice_delegation: tokens of the provider-hosted backend model that answers in a voice session (Responses delegation). */
+export type TextUsagePurpose = 'chat_response' | 'conversation_summary' | 'voice_delegation';
 export type EmbeddingUsagePurpose = 'knowledge_ingestion' | 'knowledge_query';
 
 export interface TextUsageReport {
@@ -17,6 +18,16 @@ export interface TextUsageReport {
   toolCalls: number;
   durationMs: number;
   /** Small, non-sensitive annotations (e.g. routing tier). */
+  metadata?: Record<string, string | number | boolean>;
+}
+
+export interface VoiceUsageReport {
+  provider: string;
+  model: string;
+  activeSeconds: number;
+  standbySeconds: number;
+  /** 'provider' when the provider reported the seconds; 'estimated' when derived from our own timestamps. */
+  source: 'provider' | 'estimated';
   metadata?: Record<string, string | number | boolean>;
 }
 
@@ -37,6 +48,8 @@ export interface EmbeddingUsageReport {
 export interface UsageRecorder {
   recordTextGeneration(context: UsageContext, purpose: TextUsagePurpose, report: TextUsageReport): Promise<RecordedUsage>;
   recordEmbedding(context: UsageContext, purpose: EmbeddingUsagePurpose, report: EmbeddingUsageReport): Promise<RecordedUsage>;
+  /** Session time of a realtime voice session (one record when it ends). */
+  recordVoiceSession(context: UsageContext, report: VoiceUsageReport): Promise<RecordedUsage>;
 }
 
 /** The estimate a record was stored with (also returned when storing failed, so callers can still log it). */

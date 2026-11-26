@@ -146,12 +146,17 @@ export function loadSupabaseConfig(env: Env = process.env): SupabaseConfig {
 // AI runtime
 // ---------------------------------------------------------------------------
 
-/** Price per 1M tokens in USD. Missing cached/cache-write prices fall back to the input price. */
+/**
+ * Price per 1M tokens in USD (missing cached/cache-write prices fall back to the input price), plus per-minute rates
+ * for realtime voice models billed by session time (active / standby).
+ */
 export const modelPriceSchema = z.object({
-  inputPerMTok: z.number().nonnegative(),
+  inputPerMTok: z.number().nonnegative().default(0),
   cachedInputPerMTok: z.number().nonnegative().optional(),
   cacheWritePerMTok: z.number().nonnegative().optional(),
   outputPerMTok: z.number().nonnegative().default(0),
+  activePerMinute: z.number().nonnegative().optional(),
+  standbyPerMinute: z.number().nonnegative().optional(),
 });
 
 // 'default' sends no reasoning setting at all (provider default) — required for models without reasoning support.
@@ -295,6 +300,70 @@ export function loadAiConfig(env: Env = process.env): AiConfig {
     spendLimits: { dailyUsd: parsed.AI_ORG_DAILY_SPEND_LIMIT_USD, monthlyUsd: parsed.AI_ORG_MONTHLY_SPEND_LIMIT_USD },
     pricingOverrides: parsed.AI_MODEL_PRICING_JSON,
     pricingVersion: parsed.AI_PRICING_VERSION,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Realtime voice (Phase 2): GPT-Live sessions run by the voice gateway
+// ---------------------------------------------------------------------------
+
+const voiceSchema = z.object({
+  AI_VOICE_PROVIDER: nonEmpty.default('openai'),
+  AI_VOICE_MODEL: nonEmpty.default('gpt-live-1.1'),
+  AI_VOICE_NAME: z.string().trim().min(1).max(64).default('marin'),
+  // Which engine produces the spoken content: 'responses' (provider-hosted backend model, our tools on the sideband)
+  // or 'client' (our agent runtime; the voice model speaks what it returns). See ARCHITECTURE.md §18.
+  AI_VOICE_DELEGATION: z.enum(['responses', 'client']).default('responses'),
+  // Backend model for Responses delegation (a Responses-capable model; the cheap text model by default).
+  AI_VOICE_DELEGATION_MODEL: nonEmpty.optional(),
+  VOICE_MAX_SESSION_SECONDS: z.coerce.number().int().min(30).max(7_200).default(600),
+  VOICE_MAX_CONCURRENT_SESSIONS: z.coerce.number().int().min(0).max(1_000).default(2),
+  // Session starts per organization per minute (each WebRTC session creation is billed by the provider).
+  VOICE_SESSION_STARTS_PER_MINUTE: z.coerce.number().int().min(1).max(1_000).default(6),
+  // Provider idle timeout before the session returns to (cheaper) standby: 5-60 s.
+  VOICE_IDLE_TIMEOUT_SECONDS: z.coerce.number().int().min(5).max(60).default(20),
+  // Estimated delegated-model spend reserved per session minute on top of voice time (Responses delegation).
+  VOICE_DELEGATED_TEXT_RESERVE_PER_MINUTE_USD: z.coerce.number().min(0).max(10).default(0.01),
+  VOICE_GATEWAY_URL: z.url().default('http://127.0.0.1:4100'),
+  VOICE_GATEWAY_PORT: z.coerce.number().int().min(1).max(65_535).default(4100),
+  VOICE_GATEWAY_SECRET: z.string().min(32, 'must be at least 32 characters').optional(),
+  // The developer voice page (/o/<org>/voice-lab) is off unless explicitly enabled.
+  VOICE_DEV_ENABLED: booleanString.default(false),
+});
+
+export type VoiceDelegation = 'responses' | 'client';
+
+export interface VoiceConfig {
+  provider: string;
+  model: string;
+  voice: string;
+  delegation: VoiceDelegation;
+  /** Responses delegation backend model (configured text model when unset). */
+  delegationModel: string | undefined;
+  maxSessionSeconds: number;
+  maxConcurrentSessions: number;
+  sessionStartsPerMinute: number;
+  idleTimeoutSeconds: number;
+  delegatedTextReservePerMinuteUsd: number;
+  gateway: { url: string; port: number; secret: string | undefined };
+  devPageEnabled: boolean;
+}
+
+export function loadVoiceConfig(env: Env = process.env): VoiceConfig {
+  const parsed = parseSection('voice', voiceSchema, env);
+  return {
+    provider: parsed.AI_VOICE_PROVIDER,
+    model: parsed.AI_VOICE_MODEL,
+    voice: parsed.AI_VOICE_NAME,
+    delegation: parsed.AI_VOICE_DELEGATION,
+    delegationModel: parsed.AI_VOICE_DELEGATION_MODEL,
+    maxSessionSeconds: parsed.VOICE_MAX_SESSION_SECONDS,
+    maxConcurrentSessions: parsed.VOICE_MAX_CONCURRENT_SESSIONS,
+    sessionStartsPerMinute: parsed.VOICE_SESSION_STARTS_PER_MINUTE,
+    idleTimeoutSeconds: parsed.VOICE_IDLE_TIMEOUT_SECONDS,
+    delegatedTextReservePerMinuteUsd: parsed.VOICE_DELEGATED_TEXT_RESERVE_PER_MINUTE_USD,
+    gateway: { url: parsed.VOICE_GATEWAY_URL, port: parsed.VOICE_GATEWAY_PORT, secret: parsed.VOICE_GATEWAY_SECRET },
+    devPageEnabled: parsed.VOICE_DEV_ENABLED,
   };
 }
 

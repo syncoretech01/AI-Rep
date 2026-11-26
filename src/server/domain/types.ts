@@ -1,7 +1,7 @@
 /** Domain primitives shared across modules. */
 
-/** Communication channels. Phase 1 ships web chat only; voice/phone are added by later phases. */
-export const CHANNELS = ['web_chat'] as const;
+/** Communication channels. Web chat (Phase 1) and browser voice (Phase 2 proof of concept); phone comes in Phase 3. */
+export const CHANNELS = ['web_chat', 'web_voice'] as const;
 export type Channel = (typeof CHANNELS)[number];
 
 export const MEMBER_ROLES = ['owner', 'admin', 'member'] as const;

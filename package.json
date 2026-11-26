@@ -19,13 +19,14 @@
     "db:seed": "tsx --conditions=react-server scripts/seed.ts",
     "knowledge:reembed": "tsx --conditions=react-server scripts/reembed-knowledge.ts",
     "eval:live": "tsx --conditions=react-server scripts/eval-live.ts",
-    "validate:live": "tsx --conditions=react-server scripts/validate-live.ts"
+    "validate:live": "tsx --conditions=react-server scripts/validate-live.ts",
+    "voice:gateway": "tsx --conditions=react-server scripts/voice-gateway.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",
     "@supabase/supabase-js": "^2.117.3",
     "next": "^16.4.6",
-    "openai": "^7.30.0",
+    "openai": "^7.64.0",
     "pg": "^8.23.1",
     "react": "19.3.0",
     "react-dom": "19.3.0",

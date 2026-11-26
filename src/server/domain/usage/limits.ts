@@ -25,12 +25,17 @@ export interface OrganizationLimits {
   dailySpendUsd: number;
   monthlySpendUsd: number;
   maxConversationTurns: number;
+  maxConcurrentVoiceSessions: number;
+  maxVoiceSessionSeconds: number;
 }
 
 export interface LimitDefaults {
   dailySpendUsd: number;
   monthlySpendUsd: number;
   maxConversationTurns: number;
+  /** Defaults when no voice limits are configured: effectively unlimited, so text-only setups need not set them. */
+  maxConcurrentVoiceSessions?: number;
+  maxVoiceSessionSeconds?: number;
 }
 
 export type LimitScope = 'daily_spend' | 'monthly_spend';
@@ -69,6 +74,14 @@ export interface UsageGuard {
   reserveText(organizationId: string, call: { model: string; inputTokens: number; maxOutputTokens: number }): Promise<Reservation>;
   /** Reserves the cost of embedding `inputTokens` tokens. Throws UsageLimitError like reserveText. */
   reserveEmbedding(organizationId: string, call: { model: string; inputTokens: number }): Promise<Reservation>;
+  /**
+   * Reserves a whole voice session up front: `maxSeconds` of active time at the voice model's rate plus an allowance
+   * for delegated text, held for the session's lifetime (it expires on its own if the gateway crashes).
+   */
+  reserveVoice(
+    organizationId: string,
+    session: { model: string; maxSeconds: number; extraUsd: number },
+  ): Promise<Reservation>;
   /** Releases a reservation once its usage is recorded (or the call failed). Never throws. */
   release(reservation: Reservation): Promise<void>;
   /** The organization's effective limits (overrides over defaults). */
@@ -77,11 +90,15 @@ export interface UsageGuard {
 
 /** Longer than any single provider call (including retries) and the chat turn deadline. */
 const RESERVATION_TTL_SECONDS = 180;
+/** A voice reservation outlives its session by this margin (teardown, usage reconciliation). */
+const VOICE_RESERVATION_MARGIN_SECONDS = 120;
 
 interface LimitsRow {
   daily_ai_spend_usd: string | number | null;
   monthly_ai_spend_usd: string | number | null;
   max_conversation_turns: string | number | null;
+  max_concurrent_voice_sessions: string | number | null;
+  max_voice_session_seconds: string | number | null;
 }
 
 interface SpendRow extends LimitsRow {
@@ -96,6 +113,14 @@ function effectiveLimits(row: LimitsRow | null, defaults: LimitDefaults): Organi
     monthlySpendUsd: row?.monthly_ai_spend_usd == null ? defaults.monthlySpendUsd : toNumber(row.monthly_ai_spend_usd),
     maxConversationTurns:
       row?.max_conversation_turns == null ? defaults.maxConversationTurns : toNumber(row.max_conversation_turns),
+    maxConcurrentVoiceSessions:
+      row?.max_concurrent_voice_sessions == null
+        ? (defaults.maxConcurrentVoiceSessions ?? Number.MAX_SAFE_INTEGER)
+        : toNumber(row.max_concurrent_voice_sessions),
+    maxVoiceSessionSeconds:
+      row?.max_voice_session_seconds == null
+        ? (defaults.maxVoiceSessionSeconds ?? Number.MAX_SAFE_INTEGER)
+        : toNumber(row.max_voice_session_seconds),
   };
 }
 
@@ -104,6 +129,7 @@ export async function readSpend(sql: Sql, organizationId: string, defaults: Limi
   const row = maybeOne(
     await sql.query<SpendRow>(
       `select l.daily_ai_spend_usd, l.monthly_ai_spend_usd, l.max_conversation_turns,
+              l.max_concurrent_voice_sessions, l.max_voice_session_seconds,
               coalesce((select d.estimated_cost_usd from app_private.usage_daily_totals d
                         where d.organization_id = $1 and d.usage_date = (now() at time zone 'UTC')::date), 0) as day_spent,
               coalesce((select sum(d.estimated_cost_usd) from app_private.usage_daily_totals d
@@ -141,7 +167,13 @@ export function createUsageGuard(deps: {
 }): UsageGuard {
   const { db, costs, defaults, logger } = deps;
 
-  async function reserve(organizationId: string, amountUsd: number, kind: string, model: string): Promise<Reservation> {
+  async function reserve(
+    organizationId: string,
+    amountUsd: number,
+    kind: string,
+    model: string,
+    ttlSeconds: number = RESERVATION_TTL_SECONDS,
+  ): Promise<Reservation> {
     if (!isUuid(organizationId)) throw new Error('reserve: invalid organization id');
     const amount = Number.isFinite(amountUsd) && amountUsd > 0 ? amountUsd : 0;
     const outcome = await db.transaction(async (sql) => {
@@ -162,7 +194,7 @@ export function createUsageGuard(deps: {
           `insert into app_private.usage_reservations (organization_id, resource, amount, expires_at)
            values ($1, 'ai_spend_usd', $2, now() + make_interval(secs => $3::double precision))
            returning id`,
-          [organizationId, amount.toFixed(8), RESERVATION_TTL_SECONDS],
+          [organizationId, amount.toFixed(8), ttlSeconds],
         ),
       );
       if (!row) throw new Error('usage reservation insert returned no row');
@@ -197,6 +229,11 @@ export function createUsageGuard(deps: {
     reserveEmbedding(organizationId, call) {
       return reserve(organizationId, costs.embedding(call.model, call.inputTokens).usd, 'embedding', call.model);
     },
+    reserveVoice(organizationId, session) {
+      const voice = costs.voice(session.model, { activeSeconds: session.maxSeconds, standbySeconds: 0 }).usd;
+      const extra = Number.isFinite(session.extraUsd) && session.extraUsd > 0 ? session.extraUsd : 0;
+      return reserve(organizationId, voice + extra, 'voice_session', session.model, session.maxSeconds + VOICE_RESERVATION_MARGIN_SECONDS);
+    },
     async release(reservation) {
       try {
         await db.query('delete from app_private.usage_reservations where id = $1 and organization_id = $2', [
@@ -212,7 +249,8 @@ export function createUsageGuard(deps: {
       if (!isUuid(organizationId)) return effectiveLimits(null, defaults);
       const row = maybeOne(
         await db.query<LimitsRow>(
-          `select daily_ai_spend_usd, monthly_ai_spend_usd, max_conversation_turns
+          `select daily_ai_spend_usd, monthly_ai_spend_usd, max_conversation_turns,
+                  max_concurrent_voice_sessions, max_voice_session_seconds
            from app_private.organization_limits where organization_id = $1`,
           [organizationId],
         ),
@@ -240,7 +278,14 @@ export async function countEscalatedCalls(sql: Sql, organizationId: string, conv
 export const unlimitedUsageGuard: UsageGuard = {
   reserveText: (organizationId) => Promise.resolve({ id: 'unlimited', organizationId, amountUsd: 0 }),
   reserveEmbedding: (organizationId) => Promise.resolve({ id: 'unlimited', organizationId, amountUsd: 0 }),
+  reserveVoice: (organizationId) => Promise.resolve({ id: 'unlimited', organizationId, amountUsd: 0 }),
   release: () => Promise.resolve(),
   limits: () =>
-    Promise.resolve({ dailySpendUsd: Infinity, monthlySpendUsd: Infinity, maxConversationTurns: Number.MAX_SAFE_INTEGER }),
+    Promise.resolve({
+      dailySpendUsd: Infinity,
+      monthlySpendUsd: Infinity,
+      maxConversationTurns: Number.MAX_SAFE_INTEGER,
+      maxConcurrentVoiceSessions: Number.MAX_SAFE_INTEGER,
+      maxVoiceSessionSeconds: Number.MAX_SAFE_INTEGER,
+    }),
 };

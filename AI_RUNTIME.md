@@ -66,7 +66,7 @@ reasoning (the adapter already replays provider state only to the same provider 
 - Provider failover (another provider for the same tier) would plug into the retry layer as an ordered list of
   routes. It is deliberately not implemented while one provider is configured.
 
-### Realtime voice: `gpt-live-1.1` (Phase 2+)
+### Realtime voice: `gpt-live-1.1` (Phase 2 developer lab implemented; not yet live-validated)
 
 Verified: `gpt-live-1.1` (and `gpt-live-1`) are **GPT-Live API** models (`POST /v1/live/sessions`, sideband WebSocket
 `/v1/live/sessions/{id}/attach`, WebRTC / WebSocket / SIP transports). They are not available on the Realtime API
@@ -75,14 +75,21 @@ Verified: `gpt-live-1.1` (and `gpt-live-1`) are **GPT-Live API** models (`POST /
 - Billing: **per second — $0.05 per active minute, $0.02 per standby minute**; creating a WebRTC session bills 15 s
   up front (credited later). Backend ("delegation") model tokens and input transcription are billed separately.
 - Delegation: either OpenAI runs a backend Responses model whose **function tools still execute in our app**, or our
-  own agent answers through commentary/thinking appends ("client delegation"). The choice is a Phase 2 spike decision
-  made with measurements; either way the existing agent core and tool executor remain the only business-logic engine.
+  own agent answers through commentary appends ("client delegation"). Phase 2 selects **Responses delegation**
+  (`AI_VOICE_DELEGATION=responses`), provisionally until live latency/cost measurements confirm it (VOICE_QUALITY.md):
+  OpenAI's recommended, managed tool loop with pre-warmed backend connections, the cheap text model as backend
+  (`AI_VOICE_DELEGATION_MODEL`, default `AI_TEXT_MODEL`), backend tokens reported per response
+  (`response.completed`) and metered as `voice_delegation`. Client delegation remains a switch for the comparison
+  only. Either way the existing tool executor is the only place side effects happen.
+- Session configuration is pinned at creation (model, instructions, audio) and cannot be changed by the browser: the
+  browser data channel may only send `session.close` and input mute/unmute (`client.data_channel` allowlists).
+- Standby: after `idle_timeout_s` (`VOICE_IDLE_TIMEOUT_SECONDS`, 20) without speech the session drops to the standby
+  rate; speech wakes it (`wake_policy: speech`).
 - Documented: full duplex, 28 voices, languages en/pt/es/de/fr/hi/ja/ko, idle timeout 5–60 s, close reasons.
   Not documented for GPT-Live: turn-detection/eagerness knobs, noise-reduction settings, transcription model choice.
-- Alternative to benchmark: the Realtime API's `gpt-realtime-2.1` (token-billed: audio $32 in / $0.40 cached /
-  $64 out per 1M; user audio ≈ 1 token per 100 ms, assistant ≈ 1 token per 50 ms) and `gpt-realtime-2.1-mini`. It has
-  the documented Twilio SIP guide and documented VAD/noise-reduction settings. `gpt-realtime` / `gpt-realtime-mini`
-  shut down 2027-01-20.
+- Telephone: GPT-Live supports SIP natively (inbound via `live.transport.incoming` + accept/reject/refer/hang up,
+  outbound via `POST /v1/live/sessions` with a SIP transport), with carrier trunks such as Twilio. The Realtime API
+  (`gpt-realtime-2.1`) is no longer needed as a telephony fallback; it is not used.
 - A sequential STT → text model → TTS pipeline and browser SpeechRecognition/SpeechSynthesis are **not** the primary
   production voice architecture. An "economy voice" mode may be benchmarked in Phase 8 against VOICE_QUALITY.md.
 
@@ -151,6 +158,11 @@ only; tenants cannot change their own limits).
 | Visitor messages per conversation | `AI_MAX_CONVERSATION_TURNS` (100) | New messages refused ("start a new chat"); nothing persisted |
 | Premium-model calls per conversation | `AI_MAX_ESCALATED_CALLS_PER_CONVERSATION` (6) | Escalation declined; default model continues |
 | Requests per client / widget / organization per minute | `RATE_LIMIT_*` (20 / 120 / 300) | HTTP 429 with Retry-After |
+| Simultaneous voice sessions per organization | `VOICE_MAX_CONCURRENT_SESSIONS` (2), lowered by `max_concurrent_voice_sessions` | New session refused before the provider is called (gateway 409) |
+| Voice session starts per organization per minute | `VOICE_SESSION_STARTS_PER_MINUTE` (6) | Start refused before the provider is called (each creation is billed) |
+| Voice session length | `VOICE_MAX_SESSION_SECONDS` (600), lowered by `max_voice_session_seconds` | Session closed at the limit |
+| Voice silence | 120 s without any speech | Session closed (abandoned tab) |
+| Voice session spend | Whole maximum length reserved up front, priced as active, plus `VOICE_DELEGATED_TEXT_RESERVE_PER_MINUTE_USD` (0.01) per minute | Session refused when the reservation does not fit the daily/monthly limit |
 
 **Concurrency-safe reservations** (`src/server/domain/usage/limits.ts`): before each provider call (chat round,
 summary, embedding batch) the runtime reserves a conservative estimate of the call's cost: input over-estimated at
@@ -166,15 +178,21 @@ logs `usage.pricing_missing` (error) for any configured model without a price, a
 `usage.pricing_unknown` once — configure prices for every model in use. When the limit refuses an escalation, the turn
 continues on the default model (`ai.route.escalation_declined`) rather than failing.
 
-**Designed for later limits**: the reservation table's `resource` column (`ai_spend_usd` today) and the limits table
-take voice minutes, concurrent calls and SMS segments in Phases 2–4 without a new mechanism.
+**Voice sessions** reserve their worst case for the session's lifetime (TTL: maximum length + 120 s) and release
+it when the gateway settles the session with provider-reported seconds (or, after a crash or lost sideband, elapsed
+time priced as active). Delegated-model tokens are recorded per backend response while the session runs. A session
+that ends before its reservation is settled can therefore never overshoot the limit; a gateway crash leaves the
+reservation to expire and the session to be settled by the stale-session sweep.
+
+**Designed for later limits**: the reservation table's `resource` column and the limits table take concurrent calls
+and SMS segments in Phases 3–4 without a new mechanism.
 
 ## Provider boundaries
 
 Implemented: `TextModelProvider`, `EmbeddingProvider` (contracts in `src/server/ai/types.ts`; OpenAI adapters in
-`src/server/ai/openai/`), `ProviderError` normalization, `ModelRouter`, retry policy. Added when their phase needs
-them (no speculative interfaces): `RealtimeVoiceProvider` (Phase 2), `TelephonyCarrier` (Phase 3), an SMS sender
-(Phase 4). Domain services never depend on provider SDK types; adapters translate provider-native events into
+`src/server/ai/openai/`), `RealtimeVoiceProvider` (`src/server/ai/voice-types.ts`; GPT-Live adapter
+`src/server/ai/openai/live-provider.ts`), `ProviderError` normalization, `ModelRouter`, retry policy. Added when
+their phase needs them (no speculative interfaces): `TelephonyCarrier` (Phase 3), an SMS sender (Phase 4). Domain services never depend on provider SDK types; adapters translate provider-native events into
 domain events.
 
 ## Environment configuration
@@ -211,9 +229,22 @@ AI_ORG_MONTHLY_SPEND_LIMIT_USD=150
 # AI_PRICING_VERSION=2026-11-26
 # AI_MODEL_PRICING_JSON={"model-id":{"inputPerMTok":0.1,"cachedInputPerMTok":0.01,"cacheWritePerMTok":0.125,"outputPerMTok":0.5}}
 
-# Phase 2 (not read yet)
-# AI_VOICE_PROVIDER=openai
-# AI_VOICE_MODEL=gpt-live-1.1
+# Realtime voice (Phase 2; read by the voice gateway and the voice lab)
+AI_VOICE_PROVIDER=openai
+AI_VOICE_MODEL=gpt-live-1.1
+AI_VOICE_NAME=marin
+AI_VOICE_DELEGATION=responses
+# AI_VOICE_DELEGATION_MODEL=        (default: AI_TEXT_MODEL)
+VOICE_MAX_SESSION_SECONDS=600
+VOICE_MAX_CONCURRENT_SESSIONS=2
+VOICE_SESSION_STARTS_PER_MINUTE=6
+VOICE_IDLE_TIMEOUT_SECONDS=20
+VOICE_DELEGATED_TEXT_RESERVE_PER_MINUTE_USD=0.01
+VOICE_GATEWAY_URL=http://127.0.0.1:4100
+VOICE_GATEWAY_PORT=4100
+# VOICE_GATEWAY_SECRET=             (≥ 32 random characters, shared by the app and the gateway)
+VOICE_DEV_ENABLED=false
+# Voice prices are per minute: AI_MODEL_PRICING_JSON={"gpt-live-1.1":{"activePerMinute":0.05,"standbyPerMinute":0.02}}
 ```
 
 ## Context budgeting
@@ -250,8 +281,9 @@ an invented answer.
 
 `usage_records` per provider call: organization, agent, conversation, purpose, provider, model (as reported),
 input / cached / cache-write / output / reasoning tokens, tool calls, duration, estimated cost, `pricing_known`,
-`pricing_version`, and metadata `{tier, round, route, attempts, firstTokenMs}`. Voice seconds, transcription seconds
-and telephony minutes join in Phase 2/3.
+`pricing_version`, and metadata `{tier, round, route, attempts, firstTokenMs}`. Voice sessions add one
+`voice_session` record per session (active and standby seconds, `usageSource` provider|estimated) and
+`voice_delegation` text records for backend tokens; telephony minutes join in Phase 3.
 
 Structured log events (JSON, secrets and customer text redacted) use one naming convention, `<area>.<subject>.<event>`,
 with shared fields (`organizationId`, `agentId`, `conversationId`, `channel`, `turnId`, `provider`, `model`, `tier`,
@@ -267,8 +299,10 @@ with shared fields (`organizationId`, `agentId`, `conversationId`, `channel`, `t
 | `agent.tool.*` | toolName, toolRunId, outcome (durations also in `tool_runs.duration_ms`) |
 | `usage.limit.enforced` | resource, scope, limit, used/spent |
 
-Voice sessions and calls (Phase 2+) reuse the same fields with a session id (call/voice session) and interaction id
-(turn) and add `voice.*` / `telephony.*` events; see ARCHITECTURE.md §17.
+Voice sessions reuse the same fields with `voiceSessionId` and add `voice.session.started`, `voice.session.ended`
+(status, reason, active/standby seconds, usage source, cost, tool calls, interruptions, delegated turns),
+`voice.session.{start_failed,max_duration,silence,settle_failed}`, `voice.tool.*`, `voice.delegation.*`,
+`voice.provider.error`, `voice.sideband.disconnected`, `voice.recovery.*` and `voice.gateway.*`; telephony adds `telephony.*` in Phase 3 (ARCHITECTURE.md §17).
 
 ## Rough runtime economics (Standard prices, 2026-11-26)
 

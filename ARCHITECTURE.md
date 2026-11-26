@@ -70,15 +70,16 @@ an SMS sender in Phase 4.
 - Rate limits per client (IPv6 per /64), widget and organization; one turn per conversation at a time (§14).
 - Embedding is controlled per widget with allowed sites (CSP `frame-ancestors`, §15); this is not authentication.
 
-### Web voice (Phase 2 proof of concept, Phase 5 production)
+### Web voice (Phase 2 developer lab implemented; Phase 5 production)
 
-`browser mic ⇄ WebRTC ⇄ OpenAI GPT-Live session`, with our voice gateway attached to the session's sideband for
-tools, transcripts, metering and control. Details in §18.
+`browser mic ⇄ WebRTC ⇄ OpenAI GPT-Live session`; our server only forwards the SDP offer to the voice gateway, which
+creates the session with pinned configuration and holds its sideband for tools, transcripts, metering and control.
+Details in §18.
 
 ### Phone (Phase 3)
 
-`PSTN → Twilio number → Twilio Elastic SIP Trunk → OpenAI SIP → GPT-Live session`, with the voice gateway handling
-the incoming-call webhook, accepting with the tenant's configuration and attaching the sideband. Details in §18.
+`PSTN → Twilio (SIP trunk) → OpenAI SIP → GPT-Live session`, with the voice gateway handling the incoming-call
+webhook, accepting with the tenant's configuration and attaching the same sideband. Details in §18.
 Telephone call state lives on the server (§7), never in browser state.
 
 ### Outbound calls (Phase 6)
@@ -248,58 +249,84 @@ For voice (Phase 2+) the same conventions extend with `sessionId` (voice session
 user turn), and `voice.*` / `telephony.*` events for timing marks VOICE_QUALITY.md measures (speech end, first audio,
 interruption, audio stop, tool start/end, transfer, disconnect reason).
 
-## 18. Realtime voice architecture (designed; Phase 2+)
+## 18. Realtime voice architecture (browser path implemented in Phase 2; telephone Phase 3)
 
-Verified against OpenAI and Twilio documentation on 2026-11-26 (sources in AI_RUNTIME.md and VOICE_QUALITY.md).
+Verified against the OpenAI GPT-Live documentation (live, voice-webrtc, live-delegation, live-conversations,
+voice-server-controls, voice-sip) on 2026-11-26; sources in AI_RUNTIME.md and VOICE_QUALITY.md. Phase 2 implements
+the browser path below as a developer proof of concept (`/o/<org>/voice-lab`); it has **not yet been exercised against
+the live provider** (LIVE_VALIDATION.md).
 
-**Browser (Phase 2 POC, Phase 5 production)**
+**Browser (Phase 2 developer lab; Phase 5 production widget)**
 
-1. The visitor starts voice in the widget; the browser creates a WebRTC offer and sends it, with our short-lived
-   signed voice-session token, to our endpoint.
-2. The server resolves tenant and agent, checks limits (concurrent sessions, voice-minute budget via the reservation
-   `resource`), and calls `POST /v1/live/sessions` with the permanent API key, pinning `model` (`gpt-live-1.1`),
-   instructions (from the shared ContextAssembler), voice, delegation mode, and a restricted
-   `session.client.data_channel.allowed_client_events` / `allowed_server_events` (if omitted the browser may send
-   anything). Model, instructions and audio settings are immutable after start.
-3. The SDP answer goes back to the browser; audio flows browser ⇄ OpenAI directly. No provider key or client secret
-   ever reaches the browser.
-4. The voice gateway attaches at once to `wss://api.openai.com/v1/live/sessions/{id}/attach` (the sideband replays
-   only the last 3 s; events are de-duplicated by `event_id`).
+1. The browser captures the microphone (echo cancellation, noise suppression), creates an `RTCPeerConnection` with
+   the provider's `oai-events` data channel, gathers ICE and posts the SDP offer to `POST /api/voice-lab/sessions`
+   (same-origin, signed-in owner/admin, `VOICE_DEV_ENABLED=true`).
+2. The Next.js route resolves organization and agent server-side and forwards the offer to the voice gateway
+   (`POST /v1/voice-sessions`, shared `VOICE_GATEWAY_SECRET`). Signaling only: audio never passes through our servers.
+3. The gateway checks the agent, the concurrent-session limit and the session-length cap, **reserves the session's
+   worst-case spend for its whole maximum length** (all of it priced as active voice, plus a delegated-text
+   allowance), opens a `voice_sessions` row and a `web_voice` conversation, takes the conversation's turn lock
+   (fencing token for every write), and calls `POST /v1/live/sessions` with the permanent API key. Pinned there and
+   immutable: `model` (`AI_VOICE_MODEL`, `gpt-live-1.1`), the voice model's own instructions (persona, conversation,
+   delegation and interruption policy), voice, delegation (business rules and our tool schemas travel with the
+   delegation, never through the browser), standby (`wake_policy: speech`, `idle_timeout_s`), a hashed
+   `safety_identifier`, and the browser's data-channel allowlists: the browser may only send `session.close` and
+   `session.input_audio.mute`/`unmute`, and only receives lifecycle, transcript deltas, usage and errors (never
+   delegation, tool or backend events). GPT-Live needs no ephemeral client secret: the SDP answer is returned to the
+   browser and media flows browser ⇄ OpenAI directly.
+4. The gateway attaches to `wss://api.openai.com/v1/live/sessions/{id}/attach` immediately (the sideband replays only
+   the last 3 s; events are de-duplicated by `event_id`, reflected audio is ignored).
 
-**Telephone (Phase 3)**
+**Telephone (Phase 3; not implemented).** GPT-Live supports SIP natively, inbound and outbound:
 
-1. Twilio number → Elastic SIP Trunk with origination URI `sip:proj_<id>@sip.api.openai.com;transport=tls`, Secure
-   Trunking (TLS + SRTP), and a secret `X-` header on the URI.
-2. OpenAI sends `live.transport.incoming` to the gateway: verify the Standard Webhooks signature, de-duplicate on
-   `webhook-id`, check the secret header in `sip_headers` (untrusted otherwise), resolve the tenant from the dialed
-   number (Twilio's `Diversion` header).
-3. `POST /v1/live/sessions/{id}/accept` with the tenant's configuration, attach the sideband, run the same tool path.
-   Transfer to a person with `/refer` (blind transfer; Twilio per-trunk setting); DTMF events supported; limits 2 h
-   per call, 3 min ringing.
+1. Inbound: a carrier SIP trunk (OpenAI's guide names Twilio as an example) points at
+   `sip:proj_<id>@sip.api.openai.com;transport=tls`; OpenAI sends `live.transport.incoming` to our webhook (verify the
+   Standard Webhooks signature, de-duplicate on `webhook-id`, treat `sip_headers` as untrusted except our secret
+   header, resolve the tenant from the dialed number); the gateway accepts with the tenant's configuration
+   (`/accept`), or rejects, transfers (`/refer`) or hangs up, and attaches the same sideband.
+2. Outbound: `POST /v1/live/sessions` with a SIP transport places the call through the configured trunk (Phase 6
+   approved workflows only).
+3. Twilio connectivity is either an Elastic SIP Trunk to OpenAI SIP or Twilio's own GPT-Live integrations; the
+   carrier choice stays behind the telephony service boundary (CLAUDE.md 17). Earlier notes that only the Realtime
+   API had a documented Twilio SIP path are outdated.
 
-**The voice gateway (persistent Node service)** reuses `src/server`: it executes tool calls through the existing
-executor (registry, Zod validation, capability checks, idempotency, operation records, audit, fencing), persists
-transcript turns into the same conversations/messages, meters session seconds and backend tokens into
-`usage_records`, and enforces limits. It runs as long-lived processes (not serverless) because sideband connections
-last up to the call length.
+**The voice gateway** (`npm run voice:gateway`, `src/server/voice-gateway.ts`) is a persistent Node process — the
+second entry point of the same codebase, because sidebands live as long as the session. It reuses `src/server`:
+tool calls go through the existing executor (registry, Zod validation, channel availability, idempotency,
+operation records, audit, fencing); transcripts are appended to the same conversations/messages; session seconds
+and delegated-model tokens are metered into `usage_records`; limits come from the same usage guard. One handler per
+event: tool calls are de-duplicated by `call_id` and run one at a time; GPT-Live needs one `response.create` after
+the last pending function output. Every 15 s the gateway heartbeats each session; sessions whose gateway stopped
+heartbeating for 90 s are claimed atomically by another instance, closed at the provider and settled with estimated
+usage (at startup and every 60 s).
 
-**Delegation** (decided in the Phase 2 spike with latency and cost measurements): OpenAI-hosted Responses delegation
-(our function tools still execute in our gateway) or client delegation (our agent core and `gpt-6-luna` produce the
-content; the voice model speaks it). Either way there is exactly one business-logic engine.
+**Limits and cleanup.** A session ends at the first of: the caller or developer ends it, the maximum length
+(`VOICE_MAX_SESSION_SECONDS`, lowered by the organization override), 120 s without any speech, a fatal provider
+error, a lost sideband (settled with estimated usage), or gateway shutdown. Ending asks the provider to close
+(final usage arrives in `session.closed`) and settles on its own after 8 s if it never confirms. Settling records
+usage (provider seconds when reported, otherwise elapsed time priced as active), ends the row, releases the
+reservation and the turn lock, and disconnects the sideband — exactly once.
 
-**Interruption and failure safety.** Barge-in cancels audio, never a committed tool run; a tool's outcome is reported
-only when the server has it; unknown external outcomes are spoken as unconfirmed; a dropped sideband or provider
-session ends or recovers the call without repeating actions (operation records); provider unavailability is never
-answered by switching models mid-call without the same safety rules.
+**Delegation (spike S2.2; provisional decision).** GPT-Live offers Responses delegation (an OpenAI-hosted backend
+model answers and calls our function tools over the sideband; our gateway executes them) and client delegation (our
+agent runtime produces the content; the voice model speaks it via `session.commentary.append`). Phase 2 selects
+**Responses delegation** as the production direction, pending live latency and cost measurements (VOICE_QUALITY.md):
+it is OpenAI's recommended path, keeps the documented tool loop and pre-warmed backend connections, uses the cheap
+configured text model as backend (`AI_VOICE_DELEGATION_MODEL`, default `AI_TEXT_MODEL`), and still executes every
+tool in our executor. Client delegation stays only as a configuration switch (`AI_VOICE_DELEGATION=client`) to
+measure the comparison; it is not a second maintained architecture. Either way there is exactly one business-logic
+engine.
 
-**Feasibility.** Browser WebRTC + server sideband tools on GPT-Live: documented by OpenAI. Twilio Elastic SIP → OpenAI
-SIP → GPT-Live: OpenAI SIP supports GPT-Live, but the only official Twilio trunk guide targets the Realtime API
-(`gpt-realtime`) and Twilio's GPT-Live material uses Media Streams — so this path is an inference to prove first in
-Phase 2/3. Fallbacks: the Realtime API (`gpt-realtime-2.1`) with the documented Twilio SIP guide, or Twilio Media
-Streams bridged by the gateway.
+**Interruption and failure safety.** GPT-Live handles turn detection, barge-in and audio cancellation natively and
+reports no interruption event: the gateway infers a barge-in when caller speech starts before the agent's latest
+words ended, records the agent's utterance as interrupted, and never undoes a committed tool run. captureLead on
+voice refuses to save until the model confirms the caller approved the read-back (`detailsConfirmed`). A tool's
+outcome is spoken only after the executor returns it; a dropped sideband or provider session settles the session
+without repeating actions (operation records).
 
-**Not used as the primary path:** browser SpeechRecognition/SpeechSynthesis, sequential STT → LLM → TTS, raw audio
-through Next.js, audio-processing rebuilt where the provider handles it (VAD, barge-in, echo/noise handling).
+**Not used as the primary path:** browser SpeechRecognition/SpeechSynthesis, sequential STT → LLM → TTS, the
+Realtime API, raw audio through Next.js, audio processing rebuilt where the provider handles it (VAD, barge-in,
+echo/noise handling).
 
 ## 19. Human transfer (Phase 3)
 

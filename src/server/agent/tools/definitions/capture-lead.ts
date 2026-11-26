@@ -24,6 +24,12 @@ const input = z.object({
     .refine((value) => value === null || normalizeEmail(value) !== null, 'Not a valid email address.')
     .describe("The visitor's email address."),
   summary: optionalText(1000).describe('One or two sentences on what the visitor needs.'),
+  detailsConfirmed: z
+    .boolean()
+    .nullish()
+    .describe(
+      'Voice conversations only: true once you read the phone number / email back to the caller and they confirmed it.',
+    ),
 });
 
 /** A detail the visitor still has to give. A phone number or an email address is always required. */
@@ -52,12 +58,27 @@ export const captureLead = defineTool({
     '`fields` lists the details now on record. Never tell the visitor their details were saved unless this returns ' +
     'ok: true.',
   input,
-  channels: ['web_chat'],
+  channels: ['web_chat', 'web_voice'],
   requires: ['lead_capture'],
   sideEffects: 'writes',
   idempotency: 'conversation_arguments',
   label: 'Saving your details',
-  async handler(details, ctx): Promise<ToolOutcome<CaptureLeadData>> {
+  async handler({ detailsConfirmed, ...details }, ctx): Promise<ToolOutcome<CaptureLeadData>> {
+    // Speech recognition can mishear digits and spellings: on voice, nothing is saved before the caller confirmed
+    // the read-back (VOICE_QUALITY.md, critical-information read-back rules).
+    if (ctx.channel === 'web_voice' && detailsConfirmed !== true) {
+      return {
+        ok: false,
+        error: {
+          code: 'missing_information',
+          message:
+            'Read the details back to the caller (phone number digit by digit, email spelled out), ask them to ' +
+            'confirm, then call captureLead again with detailsConfirmed: true.',
+          retryable: true,
+          details: { confirmationRequired: true },
+        },
+      };
+    }
     const missing = missingDetails(details, ctx.agent.leadCapture.requiredFields);
     if (missing.length > 0) {
       return {

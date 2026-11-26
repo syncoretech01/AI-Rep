@@ -13,10 +13,13 @@ interface UsageCounts {
   reasoningTokens: number;
   toolCalls: number;
   durationMs: number;
+  /** Voice session time, in seconds (null for token usage). */
+  activeSeconds?: number;
+  standbySeconds?: number;
 }
 
 interface UsageEntry {
-  kind: 'text_generation' | 'embedding';
+  kind: 'text_generation' | 'embedding' | 'voice_session';
   purpose: string;
   provider: string;
   model: string;
@@ -30,6 +33,11 @@ const INT4_MAX = 2_147_483_647;
 /** Integer column value; a misbehaving adapter (negative, fractional, NaN) must not lose the record. */
 function count(value: number): number {
   return Number.isFinite(value) && value > 0 ? Math.min(Math.round(value), INT4_MAX) : 0;
+}
+
+/** Seconds with millisecond precision; a misbehaving value records as 0 rather than losing the record. */
+function seconds(value: number): string {
+  return (Number.isFinite(value) && value > 0 ? Math.min(value, 1e9) : 0).toFixed(3);
 }
 
 /** Fits a provider-reported label into its column (empty labels would violate the check constraint). */
@@ -66,8 +74,9 @@ export function createUsageRecorder(deps: {
         `insert into public.usage_records
            (organization_id, agent_id, conversation_id, kind, purpose, provider, model,
             input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
-            tool_calls, duration_ms, estimated_cost_usd, pricing_known, metadata, pricing_version)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18)`,
+            tool_calls, duration_ms, estimated_cost_usd, pricing_known, metadata, pricing_version,
+            active_seconds, standby_seconds)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18, $19, $20)`,
         [
           context.organizationId,
           context.agentId ?? null,
@@ -87,6 +96,8 @@ export function createUsageRecorder(deps: {
           cost.known,
           jsonParam(entry.metadata),
           cost.known ? pricingVersion : null,
+          counts.activeSeconds === undefined ? null : seconds(counts.activeSeconds),
+          counts.standbySeconds === undefined ? null : seconds(counts.standbySeconds),
         ],
       );
     } catch (error) {
@@ -154,6 +165,26 @@ export function createUsageRecorder(deps: {
         },
         cost: costs.embedding(report.model, report.inputTokens),
         metadata: report.metadata ?? {},
+      })),
+    recordVoiceSession: (context, report) =>
+      persist(context, () => ({
+        kind: 'voice_session',
+        purpose: 'voice_session',
+        provider: report.provider,
+        model: report.model,
+        counts: {
+          inputTokens: 0,
+          cachedInputTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          toolCalls: 0,
+          durationMs: count((report.activeSeconds + report.standbySeconds) * 1000),
+          activeSeconds: report.activeSeconds,
+          standbySeconds: report.standbySeconds,
+        },
+        cost: costs.voice(report.model, { activeSeconds: report.activeSeconds, standbySeconds: report.standbySeconds }),
+        metadata: { usageSource: report.source, ...report.metadata },
       })),
   };
 }

@@ -40,10 +40,10 @@ function makeTool(overrides: Partial<ToolDefinition> = {}): ToolDefinition {
 const names = (tools: readonly ToolDefinition[]) => tools.map((tool) => tool.name);
 
 describe('phase 1 tools', () => {
-  it('have stable names, web chat availability and the documented metadata', () => {
+  it('have stable names, web chat and web voice availability and the documented metadata', () => {
     expect(names(phase1Tools)).toEqual(['searchKnowledge', 'getBusinessInfo', 'getBusinessHours', 'captureLead']);
     for (const tool of phase1Tools) {
-      expect(tool.channels).toEqual(['web_chat']);
+      expect(tool.channels).toEqual(['web_chat', 'web_voice']);
       expect(tool.description.length).toBeGreaterThan(40);
       expect(tool.label).not.toBe('');
     }
@@ -174,7 +174,7 @@ describe('toModelTools', () => {
     expect(info!.parameters).toEqual({ type: 'object', properties: {}, additionalProperties: false });
     // Every lead detail is optional for the model (and may be null): the handler asks for what is missing.
     expect(lead!.parameters.required).toBeUndefined();
-    expect(Object.keys(lead!.parameters.properties)).toEqual(['name', 'phone', 'email', 'summary']);
+    expect(Object.keys(lead!.parameters.properties)).toEqual(['name', 'phone', 'email', 'summary', 'detailsConfirmed']);
     expect(lead!.parameters.properties.phone).toMatchObject({ anyOf: [{ type: 'string', maxLength: 40 }, { type: 'null' }] });
   });
 

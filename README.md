@@ -9,7 +9,8 @@ outbound calls. Status (see [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)):
 | 0 | Multi-tenant foundation | Implemented |
 | 1 | Web chatbot, knowledge, tools | Implemented |
 | 1.5 | Hardening and live validation | Implemented in code; live validation pending credentials ([LIVE_VALIDATION.md](LIVE_VALIDATION.md)) |
-| 2–8 | Realtime voice, phone, booking/SMS, voice widget, outbound, commercial readiness, templates | Planned |
+| 2 | Realtime voice engine + developer voice lab | Implemented in code; **not yet tested against the live provider** (not complete) |
+| 3–8 | Phone, booking/SMS, voice widget, outbound, commercial readiness, templates | Planned |
 
 ```
 organization → agent configuration → knowledge → web chat → searchKnowledge / business tools
@@ -36,7 +37,8 @@ src/
   app/                      Next.js routes — thin: authorize, validate, call services, render
     api/widget/*            public web chat API (session, messages [SSE], reset)
     widget/[widgetKey]      the embeddable chat page (loaded in an iframe by public/embed.js)
-    o/[orgSlug]/*           authenticated admin UI
+    o/[orgSlug]/*           authenticated admin UI (voice-lab: developer realtime voice test page)
+    api/voice-lab/*         voice lab signaling (SDP offer → voice gateway) and session status
   proxy.ts                  admin session refresh; per-widget frame-ancestors policy
   components/               React UI (admin + widget)
   shared/widget-protocol.ts Zod wire protocol shared by the widget and the API
@@ -50,10 +52,13 @@ src/
     agent/                  agent core: tool registry + executor (+ durable operations), ContextAssembler,
                             chat-turn runtime, summaries
     channels/webchat/       widget sessions (signed tokens), rate limits, SSE streaming, frame policy — no business logic
+    channels/voice/         voice session manager (GPT-Live sessions, sideband events → executor/runtime/metering),
+                            gateway HTTP API + client — no business logic
+    voice-gateway.ts        composition root of the persistent voice gateway process
     auth/                   Supabase Auth helpers + organization access
 supabase/migrations/        SQL migrations (Supabase CLI layout)
 tests/                      unit, integration (PGlite), acceptance suites
-scripts/                    migrate, seed, reembed-knowledge, eval-live, validate-live
+scripts/                    migrate, seed, reembed-knowledge, eval-live, validate-live, voice-gateway
 public/embed.js             widget loader for customer websites
 .github/workflows/ci.yml    install, typecheck, lint, tests, build
 ```
@@ -106,6 +111,23 @@ Prerequisites: Node.js 22.12+ (24 LTS recommended) and a Supabase project (or th
 | `npm run knowledge:reembed` | Re-embed knowledge after changing `AI_EMBEDDING_MODEL` (`-- --dry-run` to preview) |
 | `npm run eval:live` | Acceptance conversations + failure behaviour against the real configured AI providers (throwaway DB) |
 | `npm run validate:live` | Infrastructure checks against a real Supabase project (TLS, migrations, pooler, Auth, RLS, pgvector, concurrency, usage) |
+| `npm run voice:gateway` | The voice gateway (persistent process holding GPT-Live sidebands; needs `VOICE_GATEWAY_SECRET`) |
+
+## Realtime voice (developer lab)
+
+Phase 2 adds a browser voice test page, not a tenant-facing feature: GPT-Live (`gpt-live-1.1`) over WebRTC, with the
+voice gateway answering every tool call through the same executor as chat. To try it:
+
+1. Set `VOICE_GATEWAY_SECRET` (≥ 32 random characters) and `VOICE_DEV_ENABLED=true` in `.env.local` (with
+   `OPENAI_API_KEY` and the database settings); apply migrations (`npm run db:migrate`).
+2. Run `npm run voice:gateway` and `npm run dev` side by side.
+3. As an owner/admin, open `/o/<org-slug>/voice-lab`, start a session and speak. The page shows connection status,
+   audio levels, the live transcript, tool runs, session time and estimated cost. Sessions are capped
+   (`VOICE_MAX_SESSION_SECONDS`, 120 s of silence, concurrent and per-minute start limits, spend reservations).
+
+Calls are billed by OpenAI per second ($0.05/min active, $0.02/min standby at list price). Delegation mode, model,
+voice and limits are configuration (`AI_VOICE_*`, `VOICE_*`; see AI_RUNTIME.md). Keep `VOICE_DEV_ENABLED` off in
+any deployed environment.
 
 ## Changing models
 
@@ -149,11 +171,13 @@ every push and pull request.
 - **Model calls** run only on the server. Visitor-supplied contact details are stored on the lead as given and never
   overwrite an existing contact.
 
-## Known limitations (after Phase 1.5)
+## Known limitations (after Phase 2 code)
 
-- Not yet validated against live Supabase (Postgres 17, Supavisor) or OpenAI; tests use PGlite (Postgres 18) and fake
-  providers. Run [LIVE_VALIDATION.md](LIVE_VALIDATION.md) first.
-- Web chat only: voice, phone, SMS, callbacks, transfer, booking and billing are later phases.
+- Not yet validated against live Supabase (Postgres 17, Supavisor), OpenAI or GPT-Live; tests use PGlite (Postgres 18)
+  and fake providers. Run [LIVE_VALIDATION.md](LIVE_VALIDATION.md) first. Voice quality, latency and cost have not been
+  measured (VOICE_QUALITY.md).
+- Voice exists only as the developer lab; phone, SMS, callbacks, transfer, booking, the production voice widget and
+  billing are later phases.
 - Knowledge: manual text and TXT/Markdown uploads; synchronous ingestion; exact vector scan.
 - Fallback sentences are English.
 - Spend limits use estimated costs; provider-confirmed cost reconciliation (OpenAI Costs API) is Phase 7.

@@ -104,6 +104,16 @@ describe('createCostEstimator', () => {
     expect(costs.text('__proto__', usage({ inputTokens: 1_000 }))).toEqual({ usd: 0, known: false });
   });
 
+  it('prices realtime voice per second at the active and standby per-minute rates', () => {
+    expect(costs.voice('gpt-live-1.1', { activeSeconds: 60, standbySeconds: 60 })).toEqual({ usd: 0.07, known: true });
+    expect(costs.voice('gpt-live-1.1', { activeSeconds: 90, standbySeconds: 0 }).usd).toBeCloseTo(0.075, 10);
+    // A text-only price has no voice rate: voice time on it is unpriced, never silently free.
+    expect(costs.voice('gpt-6-luna', { activeSeconds: 60, standbySeconds: 0 })).toEqual({ usd: 0, known: false });
+    expect(costs.voice('gpt-live-1.1', { activeSeconds: -1, standbySeconds: Number.NaN }).usd).toBe(0);
+    const custom = createCostEstimator({ 'gpt-live-1.1': { inputPerMTok: 0, outputPerMTok: 0, activePerMinute: 0.1, standbyPerMinute: 0 } });
+    expect(custom.voice('gpt-live-1.1', { activeSeconds: 30, standbySeconds: 600 }).usd).toBeCloseTo(0.05, 10);
+  });
+
   it('prices negative or non-finite counts as zero', () => {
     expect(costs.text('gpt-6-luna', usage({ inputTokens: -5, outputTokens: Number.NaN })).usd).toBe(0);
     expect(costs.embedding('text-embedding-3-small', Number.POSITIVE_INFINITY).usd).toBe(0);
